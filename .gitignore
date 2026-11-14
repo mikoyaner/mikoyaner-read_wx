@@ -68,3 +68,13 @@ build/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# ----- 本项目构建产物与导出结果（导出文件含聊天明文，绝不入库）-----
+# bin/ 是 cargo 编译出的导出器 exe；native/target/ 与 native/.tools/ 是 Rust 构建缓存
+# 与便携工具链（与 v1 同口径，体积大且与机器绑定）；output/ 是聊天记录导出目录。
+output/
+bin/
+*.exe
+native/target/
+native/.tools/
+.pytest_cache/
