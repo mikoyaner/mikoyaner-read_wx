@@ -78,3 +78,4 @@ bin/
 native/target/
 native/.tools/
 .pytest_cache/
+.zcode/
