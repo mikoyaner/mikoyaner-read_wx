@@ -1,0 +1,37 @@
+[workspace]
+resolver = "2"
+members = [
+    "shared/weflow-core",
+    "wcdb",
+    "wxmsg-exporter",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+thiserror = "2"
+hex = "0.4"
+md5 = "0.7"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+rusqlite = { version = "0.32", features = ["bundled-sqlcipher-vendored-openssl"] }
+ruzstd = { version = "0.9.1", default-features = false, features = ["std"] }
+weflow-core = { path = "shared/weflow-core" }
+wcdb-native = { path = "wcdb" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+# 实现：workspace 三件套——weflow-core（v1 原样移植的数据层）、wcdb（v1 wcdb-native 移植，
+# crate-type 改 rlib 供本仓 bin 复用其群成员/媒体内省函数）、wxmsg-exporter（本项目专用导出器）。
+# 解析：workspace.dependencies 与 v1 完全同版本，保证 weflow-core/wcdb 的依赖解析结果与 v1 一致
+# （rusqlite 0.32 + bundled-sqlcipher-vendored-openssl 是解密链路的关键版本口径，不可随手升级）；
+# ruzstd 与 reply-exporter 同版（zstd 纯 Rust 解码，供消息正文解压）。release profile 抄 v1
+# （thin LTO + 单 codegen-unit + strip），产物体积与构建时间已在本机验证过。
+# 功能：统一定义三个成员包的共享依赖与发布参数。
