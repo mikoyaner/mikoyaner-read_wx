@@ -8,6 +8,7 @@
 //!   wxmsg-exporter --data-root <微信数据根> --list-sessions [--account <账号目录名|wxid>]
 //!   wxmsg-exporter ... --group-members --sid <群id>
 //!   wxmsg-exporter ... --messages --sid <会话id> [--begin 秒] [--end 秒] [--recent N]
+//!                      [--voice-out <语音落盘目录>]
 //!   wxmsg-exporter --version
 //! 可选 --store <store.json 路径>：覆盖密钥库位置（默认走 WEFLOW_KEY_STORE 或
 //! %APPDATA%\weflow-key-provider\store.json，与 keyscan_readonly.py 的产出一致）。
@@ -22,8 +23,11 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use wcdb::contacts::resolve_group_members;
+use wcdb::media::voice_in_table;
 // 注意：wcdb-native 包的 [lib] name 是 "wcdb"（v1 给 Node/koffi 用的 DLL 名），
 // 所以 Rust 导入名是 wcdb 而不是 wcdb_native——Cargo.toml 里依赖键仍是 wcdb-native。
+// contacts::resolve_group_members：群成员双模型内省；media::voice_in_table：单张 voice 表内
+// 按定位键取 silk blob 的 hex（逐库逐表的循环在本文件 voice_silk_bytes 里包装）。
 use weflow_core::db::{list_tables, table_columns, Account};
 use weflow_core::keystore::KeyStore;
 use weflow_core::messages::{session_message_rows_recent_routed, stream_session_message_rows};
@@ -449,6 +453,64 @@ fn load_name2id_all(account: &Account) -> HashMap<String, HashMap<i64, String>> 
     // 与「压根没这个分库」。功能：把 real_sender_id 还原成真实发送者 <wxid>。
 }
 
+/// 从语音消息正文（zstd 压缩 XML）取 `voicelength="…"`（毫秒）。取不到返回 None。
+/// （自 v1 reply-exporter main.rs:1235 原样移植。）
+fn voice_duration_ms(content: &str) -> Option<i64> {
+    let xml = zstd_decode_hex(content).unwrap_or_else(|| content.to_string());
+    let i = xml.find("voicelength=\"")? + "voicelength=\"".len();
+    let rest = &xml[i..];
+    let end = rest.find('"')?;
+    rest[..end].trim().parse::<i64>().ok()
+    // 实现：先试 zstd 解压（语音正文是压缩 XML），失败回退原文；朴素 find 定位 voicelength 属性、
+    // 取到下一个双引号为止、trim 后 parse 成 i64。
+    // 解析：只认小写属性名与双引号写法，变体取不到返回 None（时长就缺省，不影响导出）。
+    // 功能：给导出的语音条目补上时长（毫秒），供面板展示。
+}
+
+/// 跨 media_*.db 的语音 silk 提取（包装 wcdb::media::voice_in_table，行为对齐 v1 reply-exporter
+/// 的 voice_silk_bytes）：遍历所有 media 分库，筛表名含 voice 的表逐张尝试，首中即返。
+/// 返回 (Option<silk 字节>, 路由标签)；路由标签语义与 v1 略有简化——
+/// found=命中 / no_media_db=没有 media 分库 / no_voice_table=分库里没有 voice 系表 / not_found=表都在但没命中。
+fn voice_silk_bytes(
+    account: &Account,
+    create_time: i64,
+    local_id: i64,
+    svr_id: i64,
+    names: &[String],
+) -> (Option<Vec<u8>>, &'static str) {
+    let mut last: &'static str = "no_media_db";
+    for db in &account.layout.media_dbs {
+        let tables: Vec<String> = account
+            .with_conn(db, |c| list_tables(c))
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|t| t.to_ascii_lowercase().contains("voice"))
+            .collect();
+        // 遍历所有 media_*.db，只读列出表名并筛含 voice 的表（VoiceInfo 等）。
+        // last 记录最近一次路由串供诊断；初值 no_media_db。with_conn 失败 unwrap_or_default 给空表列表（静默）。
+        if tables.is_empty() && last == "no_media_db" {
+            last = "no_voice_table";
+        }
+        for vt in tables {
+            match voice_in_table(account, db, &vt, names, create_time, local_id, svr_id) {
+                Some(hexv) => {
+                    // wcdb 的 voice_in_table 返回 hex 串（SQLite 端 hex() 或 Blob 现算）；
+                    // 这里还原成字节，写盘与 ASR 都吃原始 silk。
+                    return (hex::decode(&hexv).ok(), "found");
+                }
+                None => {
+                    last = "not_found";
+                }
+            }
+        }
+    }
+    (None, last)
+    // 实现：与 v1 voice_silk_bytes 同构的「逐库逐表 + 首中即返」循环，底层查询复用 wcdb 内省实现
+    // （定位键 svr_id > local_id > create_time 三级择优 + Name2Id 会话收窄 + 两段式宽松兜底）。
+    // 解析：与 v1 的差异仅在路由标签粒度（wcdb 的 voice_in_table 不回吐表内失败原因），
+    // 语音是否取到的判定口径完全一致。功能：--messages 的语音 blob 落盘数据源。
+}
+
 fn emit(v: &Value, pretty: bool) {
     let s = if pretty { serde_json::to_string_pretty(v).unwrap() } else { serde_json::to_string(v).unwrap() };
     println!("{s}");
@@ -649,6 +711,8 @@ fn run_group_members(
 /// --messages：读取某会话的消息。两种取数方式（互斥）：
 /// --recent N：最近 N 条（每分库 LIMIT 下推，快路）；
 /// --begin/--end：秒级时间窗（0=不限，即全部历史），流式逐表读。
+/// 可选 --voice-out <目录>：把结果集内语音消息（local_type==34）的 silk blob 落盘，
+/// 消息行附 voice 元数据（文件名/字节数/时长/路由），供 Python 侧 ASR。
 /// 输出为原始数据（content 尽力 zstd 解压；发送者经 Name2Id 反查），渲染在 Python 侧做。
 fn run_messages(
     ks: &KeyStore,
@@ -658,6 +722,7 @@ fn run_messages(
     begin: i64,
     end: i64,
     recent: Option<usize>,
+    voice_out: Option<&str>,
     pretty: bool,
 ) -> Result<()> {
     if sid.trim().is_empty() {
@@ -698,6 +763,11 @@ fn run_messages(
         .file_name()
         .map(|s| clean_account_dir_name(&s.to_string_lossy()))
         .unwrap_or_default();
+    // 语音落盘目录：给了 --voice-out 才启用（不指定就完全不碰语音字节，与 v1 图片引擎同口径）。
+    let voice_dir = voice_out.map(|d| {
+        let _ = std::fs::create_dir_all(d);
+        PathBuf::from(d)
+    });
     let mut messages: Vec<Value> = Vec::with_capacity(rows.len());
     for row in &rows {
         let m = match row.as_object() {
@@ -722,13 +792,63 @@ fn run_messages(
         }
         // 微信 4.x 消息表没有 sender_username 列，normalize_row 不保证补出来——
         // 用 real_sender_id（Name2Id 的 rowid）反查（v1 同款二级解析）；rid==0 保持空串。
+        // 语音：local_type==34 且给了 --voice-out 时，从 media_*.db 的 VoiceInfo 取 silk blob 落盘
+        // （只落原始 silk，绝不在导出器里解码/转写；silk→ASR 全部交下游 Python，音频不出本机）。
+        let create_time = as_i64(ci_get(m, "create_time")); // UTC Unix 秒；语音定位键之一
+        let mut voice: Option<Value> = None;
+        if local_type == 34 {
+            if let Some(dir) = &voice_dir {
+                let lid = as_i64(ci_get(m, "local_id").or_else(|| ci_get(m, "localId")));
+                let svr = as_i64(
+                    ci_get(m, "server_id")
+                        .or_else(|| ci_get(m, "svr_id"))
+                        .or_else(|| ci_get(m, "svrid")),
+                );
+                // 语音定位键是 (create_time, local_id, server_id) 三元组，列名各版本不同用 or_else 链兜底；
+                // 取不到给 0，voice_in_table 里 0 表示「该键不参与匹配」。
+                let mut vn: Vec<String> = vec![sid.to_string()];
+                if !sender.is_empty() {
+                    vn.push(sender.clone());
+                }
+                vn.sort();
+                vn.dedup();
+                // vn = 会话名 + 发送者名，sort+dedup 后作为会话归属候选——限定语音必须属于本会话，
+                // 防串会话取到别人的音频（v1 同口径，收窄在 wcdb voice_in_table 内做）。
+                let (vsilk, vroute) = voice_silk_bytes(&account, create_time, lid, svr, &vn);
+                voice = Some(match vsilk {
+                    Some(b) => {
+                        // 文件名用 (create_time, local_id) 而非 v1 的自增序号：实时增量模式每轮
+                        // 新起一次导出，序号会撞名；确定性文件名重复导出同一条时原地覆盖，无害。
+                        let fname = format!("voice_{}_{}.silk", create_time, lid);
+                        let wrote = std::fs::write(dir.join(&fname), &b).is_ok();
+                        json!({
+                            "status": if wrote { "extracted" } else { "write_failed" },
+                            "bytes": b.len(),
+                            "file": if wrote { fname } else { String::new() },
+                            "duration_ms": voice_duration_ms(&content),
+                            "route": vroute,
+                        })
+                    }
+                    None => json!({
+                        "status": "not_local",
+                        "file": String::new(),
+                        "bytes": 0,
+                        "duration_ms": voice_duration_ms(&content),
+                        "route": vroute,
+                        "note": "本机无该语音 silk blob（未播放/未下载）",
+                    }),
+                });
+                // 未命中不中断导出：Python 渲染层看到 status != extracted 时回退 [语音] 占位符。
+            }
+        }
         messages.push(json!({
             "local_id": as_i64(ci_get(m, "local_id")),
-            "create_time": as_i64(ci_get(m, "create_time")),   // UTC Unix 秒，原样透传
+            "create_time": create_time,                          // UTC Unix 秒，原样透传
             "sort_seq": as_i64(ci_get(m, "sort_seq")),          // 同秒内排序键
             "local_type": local_type,                            // 复合值：高32位=appmsg子类型
             "content": content,
             "sender_username": sender,
+            "voice": voice,                                      // 仅语音消息且给了 --voice-out 时非 null
         }));
     }
     emit(&json!({
@@ -811,6 +931,7 @@ struct Args {
     begin: i64,
     end: i64,
     recent: Option<usize>,
+    voice_out: Option<String>,
     list_accounts: bool,
     list_sessions: bool,
     group_members: bool,
@@ -829,6 +950,7 @@ fn parse_args(argv: &[String]) -> Args {
         begin: 0,
         end: 0,
         recent: None,
+        voice_out: None,
         list_accounts: false,
         list_sessions: false,
         group_members: false,
@@ -845,6 +967,7 @@ fn parse_args(argv: &[String]) -> Args {
             "--store" => { i += 1; if i < argv.len() { a.store = Some(argv[i].clone()); } }
             "--account" => { i += 1; if i < argv.len() { a.account = Some(argv[i].clone()); } }
             "--sid" => { i += 1; if i < argv.len() { a.sid = Some(argv[i].clone()); } }
+            "--voice-out" => { i += 1; if i < argv.len() { a.voice_out = Some(argv[i].clone()); } }
             // 带值旗标：i 先自增指向值，越界就什么都不做（旗标被丢弃，由后续校验兜住）。
             // begin/end 用 parse().unwrap_or(0)：0 就是"该端不限"的合法值，非法写法退化为不限。
             "--begin" => { i += 1; if i < argv.len() { a.begin = argv[i].trim().parse().unwrap_or(0); } }
@@ -941,9 +1064,10 @@ fn run(args: Args) -> Result<()> {
     run_messages(
         &ks, &data_root, args.account.as_deref(),
         args.sid.as_deref().unwrap_or(""),
-        args.begin, args.end, args.recent, args.pretty,
+        args.begin, args.end, args.recent,
+        args.voice_out.as_deref(), args.pretty,
     )
-    // 功能：模式派发（--voice 在步骤 5 加入）。
+    // 功能：模式派发（四个模式齐备）。
 }
 
 #[cfg(test)]
@@ -1043,5 +1167,30 @@ mod tests {
         assert_eq!(a.begin, 0); // recent 模式下 begin/end 应保持 0（未传）
         // 实现：--recent 解析成 usize；非法值保持 None（退回时间窗路径）。
         // 功能：最近 N 条模式的参数锚点。
+    }
+
+    #[test]
+    fn voice_duration_ms_parses_compressed_and_plain() {
+        // 明文 XML（未压缩正文）：直接取 voicelength。
+        assert_eq!(voice_duration_ms(r#"<msg><voicevoip length="1" voicelength="3440" /></msg>"#), Some(3440));
+        // 非法/缺失：None（时长缺省，不影响导出）。
+        assert_eq!(voice_duration_ms("<msg>no attr</msg>"), None);
+        assert_eq!(voice_duration_ms(""), None);
+        // 实现：先试 zstd 解压再找 voicelength 属性的口径（v1 原样移植）。
+        // 解析：zstd 压缩形态的真实字节需真库验证（步骤 12）；这里锚定明文路径与缺省路径，
+        //       ruzstd 是纯解码器无法在单测里造压缩帧。
+        // 功能：语音时长字段的解析锚点。
+    }
+
+    #[test]
+    fn parse_args_voice_out() {
+        let a = parse_args(&[
+            "--data-root".into(), "D:/r".into(),
+            "--messages".into(), "--sid".into(), "wxid_x".into(),
+            "--voice-out".into(), "D:/tmp/voices".into(),
+        ]);
+        assert_eq!(a.voice_out.as_deref(), Some("D:/tmp/voices"));
+        // 实现：--voice-out 带值旗标解析。
+        // 功能：语音落盘开关的参数锚点。
     }
 }

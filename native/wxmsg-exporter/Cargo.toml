@@ -14,6 +14,7 @@ path = "src/main.rs"
 anyhow.workspace = true
 serde_json.workspace = true
 ruzstd.workspace = true
+hex.workspace = true
 weflow-core.workspace = true
 wcdb-native.workspace = true
 # 实现：五个依赖，全部走 workspace 统一版本。

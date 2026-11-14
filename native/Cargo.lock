@@ -637,6 +637,7 @@ name = "wxmsg-exporter"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "hex",
  "ruzstd",
  "serde_json",
  "wcdb-native",

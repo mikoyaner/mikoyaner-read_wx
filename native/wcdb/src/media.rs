@@ -354,7 +354,8 @@ fn name2id_rowids(conn: &Connection, table: &str, names: &[String]) -> Vec<i64> 
 }
 
 /// 读取语音 silk blob 的 hex。命中不到返回 None。
-fn find_voice_hex(
+/// 移植改动：fn 从私有提为 pub，供 wxmsg-exporter 的语音导出模式调用；函数体未动。
+pub fn find_voice_hex(
     account: &Account,
     session_id: &str,
     create_time: i64,
@@ -399,8 +400,9 @@ fn find_voice_hex(
     // ③ 功能：跨 media_*.db 的 VoiceInfo 表检索语音 silk blob，返回 hex 字符串。
 }
 
+/// 移植改动：fn 从私有提为 pub，供 wxmsg-exporter 包装「逐库逐表 + 路由标签」的提取循环；函数体未动。
 #[allow(clippy::too_many_arguments)]
-fn voice_in_table(
+pub fn voice_in_table(
     account: &Account,
     db: &Path,
     vtable: &str,
