@@ -817,9 +817,15 @@ fn run_messages(
                 let (vsilk, vroute) = voice_silk_bytes(&account, create_time, lid, svr, &vn);
                 voice = Some(match vsilk {
                     Some(b) => {
-                        // 文件名用 (create_time, local_id) 而非 v1 的自增序号：实时增量模式每轮
-                        // 新起一次导出，序号会撞名；确定性文件名重复导出同一条时原地覆盖，无害。
-                        let fname = format!("voice_{}_{}.silk", create_time, lid);
+                        // 文件名用 (create_time, local_id, 会话段) 而非 v1 的自增序号：实时增量
+                        // 模式每轮新起一次导出，序号会撞名；确定性文件名重复导出同一条时原地
+                        // 覆盖，无害。会话段（sid 非字母数字替换为下划线）防「两个会话的消息
+                        // 恰好同秒且同 local_id」的跨会话覆盖——那会把 A 会话的音频张冠李戴。
+                        let safe_sid: String = sid
+                            .chars()
+                            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+                            .collect();
+                        let fname = format!("voice_{}_{}_{}.silk", create_time, lid, safe_sid);
                         let wrote = std::fs::write(dir.join(&fname), &b).is_ok();
                         json!({
                             "status": if wrote { "extracted" } else { "write_failed" },
