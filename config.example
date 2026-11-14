@@ -27,10 +27,10 @@ WXMSG_POLL_INTERVAL_S=60
 # 导出器子进程卡死保护（秒，默认 180；超时杀子进程并在面板报错）
 # WXMSG_EXPORTER_TIMEOUT_S=180
 
-# 语音 ASR 资源目录：指向含 voice2text.cjs 与 SenseVoice 模型的 vendor 目录。
-# 不填时程序自动尝试 ../Export_from_WeChat_v1/vendor；找不到或 node 不可用时，
+# 语音 ASR 资源目录：指向 v1 项目根（其下应有 voice2text.cjs 与 vendor/ 子目录）。
+# 不填时程序自动尝试 ../Export_from_WeChat_v1；找不到或 node 不可用时，
 # 语音消息回退为 [语音] 占位符，不中断导出。
-# WXMSG_ASR_ROOT=../Export_from_WeChat_v1/vendor
+# WXMSG_ASR_ROOT=../Export_from_WeChat_v1
 
 # Node 可执行文件（语音 ASR 用；默认 node，要求在 PATH 里）
 # WXMSG_NODE_BIN=node
