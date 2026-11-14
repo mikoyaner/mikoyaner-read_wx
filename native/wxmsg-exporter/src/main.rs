@@ -6,6 +6,8 @@
 //! 用法（stdout=JSON 数据，stderr=诊断；退出码 0=成功、1=失败、2=用法错误）：
 //!   wxmsg-exporter --data-root <微信数据根> --list-accounts
 //!   wxmsg-exporter --data-root <微信数据根> --list-sessions [--account <账号目录名|wxid>]
+//!   wxmsg-exporter ... --group-members --sid <群id>
+//!   wxmsg-exporter ... --messages --sid <会话id> [--begin 秒] [--end 秒] [--recent N]
 //!   wxmsg-exporter --version
 //! 可选 --store <store.json 路径>：覆盖密钥库位置（默认走 WEFLOW_KEY_STORE 或
 //! %APPDATA%\weflow-key-provider\store.json，与 keyscan_readonly.py 的产出一致）。
@@ -18,13 +20,19 @@ use anyhow::{bail, Result};
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use wcdb::contacts::resolve_group_members;
+// 注意：wcdb-native 包的 [lib] name 是 "wcdb"（v1 给 Node/koffi 用的 DLL 名），
+// 所以 Rust 导入名是 wcdb 而不是 wcdb_native——Cargo.toml 里依赖键仍是 wcdb-native。
 use weflow_core::db::{list_tables, table_columns, Account};
 use weflow_core::keystore::KeyStore;
+use weflow_core::messages::{session_message_rows_recent_routed, stream_session_message_rows};
 use weflow_core::schema::{find_candidate, sanitize_ident};
 // 实现：依赖口径——anyhow 统一错误类型（main 返回 Result，Err 即 stderr + 退出码 1）；
-// serde_json 的 json!/Map/Value 承载全部结构化输出；HashMap 做人名词表；Path/PathBuf 做路径拼接。
-// weflow_core：db 提供 Account/with_conn/list_tables/table_columns（连接缓存与每库密钥解析），
-// keystore 提供本机 store.json 读取，schema 提供列名候选匹配与 SQL 标识符白名单。
+// serde_json 的 json!/Map/Value 承载全部结构化输出；HashMap 做人名词表与 Name2Id 映射；
+// Arc 让账号选择函数直接交付已打开的 Account，避免"探测一次 + 正式再开一次"的重复验钥。
+// wcdb_native::contacts::resolve_group_members：群成员双模型内省（v1 wcdb 原实现，rlib 化后直调）。
+// weflow_core::messages：时间窗流式读（stream_session_message_rows）与最近 N 条（*_recent_routed）。
 // 功能：与 v1 reply-exporter 相同的依赖形状，保证行为可对照。
 
 // ---- 跨版本列名适配层（自 v1 reply-exporter/src/main.rs:35-50 原样移植）----
@@ -58,9 +66,8 @@ const SORT_TS_COLS: &[&str] = &[
 //       全部落空则不排序（行序交由库），Python 侧按名称排序兜底。
 // 功能：定位会话表的活跃时间列。
 
-// 步骤 3 骨架期说明：NameInfo.username/best 与下面三个取值助手在 --list-sessions 路径尚未被
-// 消费（--list-sessions 只输出原始名称字段），它们是步骤 4 --messages 的 sender 展示链路组件，
-// 且已被单元测试覆盖——先用 allow(dead_code) 压掉过渡期警告，步骤 4 接上后即可移除。
+// 说明：NameInfo.username 字段与 best() 方法只被单元测试与内部诊断消费——本项目导出器
+// 统一输出原始名称字段（展示回退在 Python 侧），best() 保留是给将来可能的诊断子命令用。
 #[allow(dead_code)]
 #[derive(Default, Clone)]
 struct NameInfo {
@@ -75,7 +82,7 @@ struct NameInfo {
 // 功能：承载 load_names 的合并结果，供 --list-sessions 输出四个名称字段。
 
 impl NameInfo {
-    #[allow(dead_code)] // 过渡期：--messages（步骤 4）的 sender 展示链路消费
+    #[allow(dead_code)] // 仅测试/未来诊断消费，见上方说明
     fn best(&self) -> &str {
         for s in [&self.remark, &self.nickname, &self.session_display, &self.alias] {
             if !s.trim().is_empty() {
@@ -90,14 +97,12 @@ impl NameInfo {
     // 功能：v1 内部诊断展示用；--list-sessions 输出的是原始字段而非 best()。
 }
 
-#[allow(dead_code)] // 过渡期：--messages（步骤 4）的消息行解析消费
 fn ci_get<'a>(m: &'a Map<String, Value>, key: &str) -> Option<&'a Value> {
     m.iter().find(|(k, _)| k.eq_ignore_ascii_case(key)).map(|(_, v)| v)
 }
 // ci_get（自 v1 原样移植）：在 serde_json Map 上忽略 ASCII 大小写找键，返回值的借用。
 // 功能：屏蔽微信列名大小写差异。
 
-#[allow(dead_code)] // 过渡期：--messages（步骤 4）的消息行解析消费
 fn as_str(v: Option<&Value>) -> String {
     match v {
         Some(Value::String(s)) => s.clone(),
@@ -108,7 +113,6 @@ fn as_str(v: Option<&Value>) -> String {
 // as_str（自 v1 原样移植）：Option<&Value> → String；String 克隆、Number to_string、其余空串。
 // 功能：安全取文本字段，绝不 panic。
 
-#[allow(dead_code)] // 过渡期：--messages（步骤 4）的消息行解析消费
 fn as_i64(v: Option<&Value>) -> i64 {
     match v {
         Some(Value::Number(n)) => n.as_i64().unwrap_or(0),
@@ -374,6 +378,77 @@ fn account_mtime(p: &Path) -> std::time::SystemTime {
 // account_mtime（自 v1 原样移植）：stat 取 modified，失败回退 UNIX_EPOCH（排最后）。
 // 功能：「最近还被写过 = 当前登录号」的判据（微信只写当前登录账号的 session.db）。
 
+/// 解码 hex→bytes→zstd 帧为文本（自 v1 reply-exporter main.rs:1210 原样移植）。
+/// 微信 4.x 的图片/语音等消息正文是 zstd 压缩 BLOB，weflow-core 读出时被 hex 编码成字符串；
+/// 本函数把「确实是 zstd 帧的 hex 串」解回明文（XML/文本），其余输入一律 None（调用方回退原文）。
+fn zstd_decode_hex(hexstr: &str) -> Option<String> {
+    if hexstr.is_empty() || hexstr.len() % 2 != 0 || !hexstr.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    // 严格前置校验：非空、偶数长度、全 hex，任一不满足直接 None。这三条是后面字节切片不 panic 的前提。
+    let raw: Vec<u8> = (0..hexstr.len() / 2)
+        .map(|i| u8::from_str_radix(&hexstr[i * 2..i * 2 + 2], 16).ok())
+        .collect::<Option<Vec<u8>>>()?;
+    // hex 转 bytes 用 collect 成 Option<Vec<u8>> 再问号传播——任何字节解析失败整体 None，宁可放弃也不拿半截数据去解压。
+    if !raw.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]) {
+        return None;
+    }
+    // 再校验 zstd 帧魔数（28 B5 2F FD）：不是 zstd 就 None，调用方应回退用原文（明文 XML/文本不经过这里）。
+    let mut dec = ruzstd::decoding::StreamingDecoder::new(&raw[..]).ok()?;
+    let mut out = Vec::new();
+    use std::io::Read;
+    dec.read_to_end(&mut out).ok()?;
+    Some(String::from_utf8_lossy(&out).to_string())
+    // ruzstd 是纯 Rust 流式 zstd 解码器（不依赖系统 libzstd）；from_utf8_lossy 把非法字节替换成
+    // U+FFFD 而不是失败。坑（继承 v1）：没有解压后大小上限，压缩炸弹风险由"只处理本机微信库"兜住。
+    // 功能：给 Python 侧渲染层干净的 XML/文本正文（占位符/标题/引用提取都在 Python 做）。
+}
+
+/// 各消息分库的 Name2Id 映射（自 v1 load_name2id_all 原样移植）：分库文件名小写 stem →
+/// (rowid → user_name)。微信 4.x 消息表没有 sender_username 列，群聊发送者只有
+/// real_sender_id（Name2Id 表的 rowid），必须反查还原成 <wxid>。
+fn load_name2id_all(account: &Account) -> HashMap<String, HashMap<i64, String>> {
+    const N2I_NAME: &[&str] = &["user_name", "username", "user_name_", "name"];
+    let mut all: HashMap<String, HashMap<i64, String>> = HashMap::new();
+    // N2I_NAME：Name2Id 表「名称列」候选别名（按优先级）。
+    for db in &account.layout.message_dbs {
+        let stem = db.file_stem().map(|s| s.to_string_lossy().to_lowercase()).unwrap_or_default();
+        if stem.is_empty() || all.contains_key(&stem) {
+            continue;
+        }
+        // 遍历消息分库，file_stem 小写为键；同名分库只认第一个。
+        let map = (|| -> Result<HashMap<i64, String>> {
+            let tables = account.with_conn(db, |c| list_tables(c))?;
+            let table = tables
+                .iter()
+                .find(|t| t.eq_ignore_ascii_case("Name2Id"))
+                .or_else(|| tables.iter().find(|t| t.to_ascii_lowercase().contains("name2id")))
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("无 Name2Id 表"))?;
+            let cols = account.with_conn(db, |c| table_columns(c, &table))?;
+            let name_col = find_candidate(&cols, N2I_NAME).ok_or_else(|| anyhow::anyhow!("Name2Id 无名称列"))?;
+            let sql = format!(
+                "SELECT rowid, \"{}\" FROM \"{}\"",
+                sanitize_ident(&name_col)?,
+                sanitize_ident(&table)?
+            );
+            account.with_conn(db, move |conn| {
+                let mut stmt = conn.prepare(&sql)?;
+                let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+                Ok(rows.flatten().collect::<HashMap<i64, String>>())
+            })
+        })()
+        .unwrap_or_default();
+        // 立即执行闭包把整段查询包成 Result 再 unwrap_or_default：任何一步失败（无 Name2Id 表/
+        // 无名称列/SQL 错）都退化成空 map，不让整条导出失败。表名先精确匹配 Name2Id 再模糊包含；
+        // rowid 是 SQLite 伪列直接写死，名称列/表名过 sanitize_ident 后双引号包裹，无注入面。
+        all.insert(stem, map);
+    }
+    all
+    // 即使 map 为空也 insert(stem, 空 map)：下游 n2i.get(db_name) 能区分「这个分库查过但没映射」
+    // 与「压根没这个分库」。功能：把 real_sender_id 还原成真实发送者 <wxid>。
+}
+
 fn emit(v: &Value, pretty: bool) {
     let s = if pretty { serde_json::to_string_pretty(v).unwrap() } else { serde_json::to_string(v).unwrap() };
     println!("{s}");
@@ -411,15 +486,22 @@ fn account_dirs_under(root: &Path) -> Vec<(String, PathBuf)> {
     // 功能：--list-accounts 与账号选择共用的枚举出口（排序保证输出可复现）。
 }
 
-/// 选当前登录账号：数据根下「session.db 最近被写过且密钥能开库」的那只。
-/// 与 v1 pick_account_dir 的差异：本项目数据根必填且强校验，不做"根外兜底"（绝不静默读别的目录）。
-fn pick_current_account(ks: &KeyStore, data_root: &str, wanted: Option<&str>) -> Result<(PathBuf, String)> {
-    let mut openable: Vec<(PathBuf, String, std::time::SystemTime)> = Vec::new();
+/// 选当前登录账号并直接交付已打开的 Account：数据根下「session.db 最近被写过且密钥能开库」的那只。
+/// 与 v1 pick_account_dir 的差异：① 本项目数据根必填且强校验，不做"根外兜底"（绝不静默读别的目录）；
+/// ② 直接返回 Arc<Account>，调用方不必重复开库验钥；③ 支持 wanted_sid——优先选「库里真有这个会话」
+/// 的账号（v1 同判据），并把「sid 是否命中」带回去供输出层提示。
+fn pick_account_opened(
+    ks: &KeyStore,
+    data_root: &str,
+    wanted_dir: Option<&str>,
+    wanted_sid: Option<&str>,
+) -> Result<(PathBuf, Arc<Account>, bool)> {
+    let mut openable: Vec<(PathBuf, Arc<Account>, std::time::SystemTime, bool)> = Vec::new();
     let mut no_key: usize = 0;
     let mut bad_key: usize = 0;
     for (base, dir) in account_dirs_under(Path::new(data_root)) {
         // --account 显式指定时按目录名或还原出的 wxid 过滤（都做忽略大小写比较）。
-        if let Some(w) = wanted {
+        if let Some(w) = wanted_dir {
             let w = w.trim().to_ascii_lowercase();
             let wxid = clean_account_dir_name(&base).to_ascii_lowercase();
             if base.to_ascii_lowercase() != w && wxid != w {
@@ -435,15 +517,22 @@ fn pick_current_account(ks: &KeyStore, data_root: &str, wanted: Option<&str>) ->
         // 开得成 = 密钥可用 + 库结构可读，一条判据同时覆盖"有钥"与"钥有效"。
         match Account::open(session_db.to_string_lossy().as_ref(), &key) {
             Ok(a) => {
-                drop(a);
-                openable.push((dir, key, account_mtime(&session_db)));
+                let has_sid = match wanted_sid {
+                    Some(sid) => list_session_rows(&a)
+                        .iter()
+                        .any(|(u, _, _)| u.eq_ignore_ascii_case(sid)),
+                    None => false,
+                };
+                // has_sid：只有传了 wanted_sid 才查会话清单比对（忽略大小写），判断这只账号
+                // 的库里真有这个会话——v1 pick_account_dir 的同名口径，防"拿旧号数据答新号"。
+                openable.push((dir, a, account_mtime(&session_db), has_sid));
             }
             Err(_) => {
                 bad_key += 1;
             }
         }
     }
-    // 诊断信息进错误文案（不含密钥、不含用户名——账号目录名本身含 wxid，属本机诊断可接受范围，
+    // 诊断信息进错误文案（不含密钥——账号目录名本身含 wxid，属本机诊断可接受范围，
     // 与 v1 login_probe 的 note 口径一致）。
     if openable.is_empty() {
         let hint = if no_key > 0 && bad_key == 0 {
@@ -457,11 +546,20 @@ fn pick_current_account(ks: &KeyStore, data_root: &str, wanted: Option<&str>) ->
         };
         bail!("没有可用的账号——{hint}");
     }
-    // 选「session.db 最近被写过」的 = 当前登录号（v1 同判据）。
-    openable.sort_by(|a, b| b.2.cmp(&a.2));
-    let (dir, key, _) = openable.into_iter().next().unwrap();
-    Ok((dir, key))
-    // 功能：所有需要开账号的模式（--list-sessions 及后续 --messages 等）的统一账号入口。
+    // 选号优先级（v1 同款）：① 传了 wanted_sid 就取第一个 has_sid 为真的账号；
+    // ② 否则按 session.db mtime 取最大（最近被写 = 当前登录号）。
+    if wanted_sid.is_some() {
+        if let Some((dir, a, _, _)) = openable.iter().find(|x| x.3) {
+            return Ok((dir.clone(), a.clone(), true));
+        }
+    }
+    openable.sort_by(|x, y| y.2.cmp(&x.2));
+    let (dir, a, _, has_sid) = openable.into_iter().next().unwrap();
+    Ok((dir, a, has_sid))
+    // 返回 (账号目录, 已验钥的 Account, sid 是否命中)。sid 没命中任何账号时仍返回 mtime 最新的
+    // 一只 + has_sid=false——让 --messages 正常跑出 route=none/0 条，输出层的 sid_found 字段
+    // 会把「会话不在这个号」讲清楚，而不是凭空报错。
+    // 功能：--list-sessions/--group-members/--messages 的统一账号入口。
 }
 
 fn run_list_accounts(ks: &KeyStore, data_root: &str, pretty: bool) -> Result<()> {
@@ -493,24 +591,186 @@ fn run_list_accounts(ks: &KeyStore, data_root: &str, pretty: bool) -> Result<()>
     emit(&json!({ "mode": "list_accounts", "accounts": items }), pretty);
     Ok(())
     // 实现：枚举账号目录，逐个产出 (目录名, wxid, 库 mtime 距今秒, 有钥?, 钥有效?)。
-    // 解析：key_works 与 pick_current_account 一样以 Account::open 成败为准——
-    // 「有钥 ≠ 钥能用」（重登录换钥后旧钥静默打不开库，v1 踩过的坑）。
+    // 解析：key_works 以 Account::open 成败为准——「有钥 ≠ 钥能用」
+    // （重登录换钥后旧钥静默打不开库，v1 踩过的坑）。
     // 功能：面板体检页的数据源。
 }
 
-fn run_list_sessions(ks: &KeyStore, data_root: &str, wanted: Option<&str>, pretty: bool) -> Result<()> {
-    let (acct_dir, key) = pick_current_account(ks, data_root, wanted)?;
-    let session_db = acct_dir.join("db_storage").join("session").join("session.db");
-    let account = Account::open(session_db.to_string_lossy().as_ref(), &key)?;
-    // pick_current_account 已验证过一次；这里再 open 是因为 Arc<Account> 没有从探测函数带出来
-    // （探测要试多个账号，成功的那只重新 open 一次，连接缓存无所谓——进程即将退出）。
-    // 名称合并顺序（v1 口径）：先 session.db（占 session_display/nickname），再 contact.db
-    // （补 nickname/remark/alias，非空即覆盖 remark/alias）。
-    let mut names: HashMap<String, NameInfo> = HashMap::new();
-    load_names(&account, &account.layout.session_db, &mut names);
-    if let Some(cdb) = &account.layout.contact_db {
-        load_names(&account, cdb, &mut names);
+/// --group-members：列出某群的完整成员名单（含每个成员的备注/昵称/微信号与群内昵称）。
+fn run_group_members(
+    ks: &KeyStore,
+    data_root: &str,
+    wanted: Option<&str>,
+    sid: &str,
+    pretty: bool,
+) -> Result<()> {
+    if sid.trim().is_empty() {
+        bail!("--group-members 需要配合 --sid <群 id>");
     }
+    // 传 wanted_sid 让选号优先挑「库里真有这个群」的账号（多账号机器防拿错号）。
+    let (acct_dir, account, sid_found) = pick_account_opened(ks, data_root, wanted, Some(sid))?;
+    let names = build_names(&account);
+    // 群成员双模型内省（wcdb 原实现）：Err 视为该库 schema 异常，按 0 成员降级但把原因带出去，
+    // 让面板能区分「真的没成员」与「成员表解析失败」。
+    let (members, members_error) = match resolve_group_members(&account, sid) {
+        Ok(v) => (v, None),
+        Err(e) => (Vec::new(), Some(e.to_string())),
+    };
+    let items: Vec<Value> = members
+        .into_iter()
+        .map(|m| {
+            let info = names.get(&m.username);
+            json!({
+                "username": m.username,
+                "group_display": m.display,      // 群内昵称（群成员列表列/成员表），可空
+                "remark": info.map(|n| n.remark.clone()).unwrap_or_default(),
+                "nickname": info.map(|n| n.nickname.clone()).unwrap_or_default(),
+                "alias": info.map(|n| n.alias.clone()).unwrap_or_default(),
+            })
+        })
+        .collect();
+    emit(&json!({
+        "mode": "group_members",
+        "sid": sid,
+        "is_group": is_group(sid),
+        "sid_found": sid_found,
+        "account_dir": acct_dir.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default(),
+        "count": items.len(),
+        "members": items,
+        "error": members_error,
+    }), pretty);
+    Ok(())
+    // 实现：选号（sid 优先）→ 名称词表 → resolve_group_members 双模型 → 每成员合并四个名称字段。
+    // 解析：成员的 username 才是稳定键；display/remark/nickname/alias 都可能为空，
+    // 展示名回退（备注>昵称>微信号>id）由 Python session.py 统一做。
+    // 功能：面板群成员勾选列表的数据源。
+}
+
+/// --messages：读取某会话的消息。两种取数方式（互斥）：
+/// --recent N：最近 N 条（每分库 LIMIT 下推，快路）；
+/// --begin/--end：秒级时间窗（0=不限，即全部历史），流式逐表读。
+/// 输出为原始数据（content 尽力 zstd 解压；发送者经 Name2Id 反查），渲染在 Python 侧做。
+fn run_messages(
+    ks: &KeyStore,
+    data_root: &str,
+    wanted: Option<&str>,
+    sid: &str,
+    begin: i64,
+    end: i64,
+    recent: Option<usize>,
+    pretty: bool,
+) -> Result<()> {
+    if sid.trim().is_empty() {
+        bail!("--messages 需要配合 --sid <会话 id>");
+    }
+    let (acct_dir, account, sid_found) = pick_account_opened(ks, data_root, wanted, Some(sid))?;
+    // 路由名诊断：流式路径的 route 从索引直接取；recent 路径的 route 由 *_routed 返回。
+    // 微信改布局时这是「从哪一级路由退化」的第一现场证据（v1 同口径）。
+    let stream_route = match recent {
+        Some(_) => None,
+        None => {
+            let index = account.msg_index()?;
+            let (_tables, route) = index.session_tables_routed(&account, &sid)?;
+            Some(route)
+        }
+    };
+    // 取行：recent 走 *_routed（新→旧），流式走 ascending=true（库内升序）。
+    let (mut rows, route, time_fallback) = match recent {
+        Some(n) => {
+            let (rows, route, tf) = session_message_rows_recent_routed(&account, &sid, n)?;
+            (rows, route, tf)
+        }
+        None => {
+            let mut v: Vec<Value> = Vec::new();
+            stream_session_message_rows(&account, &sid, begin, end, true, |row| {
+                v.push(row);
+                Ok(())
+            })?;
+            (v, stream_route.unwrap_or("none"), false)
+        }
+    };
+    // recent 路径的行序是新→旧，统一翻成时间正序输出（与流式路径一致，Python 无需分叉处理）。
+    rows.reverse();
+    let n2i = load_name2id_all(&account);
+    // my_id：本人 wxid（账号目录名还原）。群聊里 real_sender_id == my_id 的消息即本人发言，
+    // Python 侧据此决定占位/展示；不在导出器里做方向判定（字段3私聊恒空，方向由需求定死）。
+    let my_id = acct_dir
+        .file_name()
+        .map(|s| clean_account_dir_name(&s.to_string_lossy()))
+        .unwrap_or_default();
+    let mut messages: Vec<Value> = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let m = match row.as_object() {
+            Some(m) => m,
+            None => continue,
+        };
+        // row 是 weflow-core normalize_row 产出的 JSON Object（BLOB 列已 hex 化、列名已归一）。
+        let local_type = as_i64(ci_get(m, "local_type"));
+        let raw_content = as_str(ci_get(m, "message_content"));
+        let content = zstd_decode_hex(&raw_content).unwrap_or(raw_content);
+        // content 尽力解压：确实是 zstd 帧的 hex 串解回明文 XML/文本；明文或解不开的保持原样
+        // （Python 渲染层按「type 1 + 内容仍像 hex」判定卡片类消息，口径与 v1 render_message 一致）。
+        let db_name = as_str(ci_get(m, "db_name")).to_lowercase();
+        let mut sender = as_str(ci_get(m, "sender_username"));
+        if sender.is_empty() {
+            let rid = as_i64(ci_get(m, "real_sender_id").or_else(|| ci_get(m, "realSenderId")));
+            if rid != 0 {
+                if let Some(uname) = n2i.get(&db_name).and_then(|mp| mp.get(&rid)) {
+                    sender = uname.clone();
+                }
+            }
+        }
+        // 微信 4.x 消息表没有 sender_username 列，normalize_row 不保证补出来——
+        // 用 real_sender_id（Name2Id 的 rowid）反查（v1 同款二级解析）；rid==0 保持空串。
+        messages.push(json!({
+            "local_id": as_i64(ci_get(m, "local_id")),
+            "create_time": as_i64(ci_get(m, "create_time")),   // UTC Unix 秒，原样透传
+            "sort_seq": as_i64(ci_get(m, "sort_seq")),          // 同秒内排序键
+            "local_type": local_type,                            // 复合值：高32位=appmsg子类型
+            "content": content,
+            "sender_username": sender,
+        }));
+    }
+    emit(&json!({
+        "mode": "messages",
+        "sid": sid,
+        "is_group": is_group(sid),
+        "sid_found": sid_found,
+        "account_dir": acct_dir.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default(),
+        "my_id": my_id,
+        "route": route,
+        "time_fallback": time_fallback,
+        "begin": begin,
+        "end": end,
+        "recent": recent,
+        "count": messages.len(),
+        "messages": messages,
+    }), pretty);
+    Ok(())
+    // 实现：选号（sid 优先）→ 路由诊断 → recent/流式两条取数路径 → 每行六字段归一 → 输出。
+    // 解析：时间窗过滤在 weflow-core 回调内做（[begin,end] 闭区间，0=不限）；行序统一为
+    // 时间正序；跨表路由（shared 模式）下跨表顺序不保证全局有序——Python 导出层按
+    // (create_time, sort_seq) 重排，这里只保证单表内有序（本机 4.x 每会话一张 md5 表，恒单表）。
+    // 功能：历史导出与实时增量的统一取数入口。
+}
+
+/// 从已打开的账号构建 username→NameInfo 词表（合并顺序 v1 口径：先 session.db 后 contact.db）。
+fn build_names(account: &Account) -> HashMap<String, NameInfo> {
+    let mut names: HashMap<String, NameInfo> = HashMap::new();
+    load_names(account, &account.layout.session_db, &mut names);
+    if let Some(cdb) = &account.layout.contact_db {
+        load_names(account, cdb, &mut names);
+    }
+    names
+    // 实现：先 session（占 session_display/nickname），再 contact（补 nickname/remark/alias，
+    // 非空即覆盖 remark/alias）——顺序决定合并语义，不能颠倒。
+    // 功能：--list-sessions/--group-members 共用的名称来源。
+}
+
+fn run_list_sessions(ks: &KeyStore, data_root: &str, wanted: Option<&str>, pretty: bool) -> Result<()> {
+    let (acct_dir, account, _sid_hit) = pick_account_opened(ks, data_root, wanted, None)?;
+    // --list-sessions 不关心特定会话，wanted_sid 传 None（纯 mtime 选号）。
+    let names = build_names(&account);
     // 会话行：sid + 会话表内显示名 + 活跃时间（list_session_rows 已按活跃时间降序）。
     let rows = list_session_rows(&account);
     let sessions: Vec<Value> = rows
@@ -547,8 +807,14 @@ struct Args {
     data_root: Option<String>,
     store: Option<String>,
     account: Option<String>,
+    sid: Option<String>,
+    begin: i64,
+    end: i64,
+    recent: Option<usize>,
     list_accounts: bool,
     list_sessions: bool,
+    group_members: bool,
+    messages: bool,
     pretty: bool,
     version: bool,
     unknown: Option<String>,
@@ -559,8 +825,14 @@ fn parse_args(argv: &[String]) -> Args {
         data_root: None,
         store: None,
         account: None,
+        sid: None,
+        begin: 0,
+        end: 0,
+        recent: None,
         list_accounts: false,
         list_sessions: false,
+        group_members: false,
+        messages: false,
         pretty: false,
         version: false,
         unknown: None,
@@ -572,9 +844,25 @@ fn parse_args(argv: &[String]) -> Args {
             "--data-root" => { i += 1; if i < argv.len() { a.data_root = Some(argv[i].clone()); } }
             "--store" => { i += 1; if i < argv.len() { a.store = Some(argv[i].clone()); } }
             "--account" => { i += 1; if i < argv.len() { a.account = Some(argv[i].clone()); } }
+            "--sid" => { i += 1; if i < argv.len() { a.sid = Some(argv[i].clone()); } }
             // 带值旗标：i 先自增指向值，越界就什么都不做（旗标被丢弃，由后续校验兜住）。
+            // begin/end 用 parse().unwrap_or(0)：0 就是"该端不限"的合法值，非法写法退化为不限。
+            "--begin" => { i += 1; if i < argv.len() { a.begin = argv[i].trim().parse().unwrap_or(0); } }
+            "--end" => { i += 1; if i < argv.len() { a.end = argv[i].trim().parse().unwrap_or(0); } }
+            // recent 解析失败保持 None（走时间窗路径），解析成功且为 0 时按"取 0 条"处理
+            // （session_message_rows_recent 对 n=0 有专门短路，返回空结果）。
+            "--recent" => {
+                i += 1;
+                if i < argv.len() {
+                    if let Ok(n) = argv[i].trim().parse::<usize>() {
+                        a.recent = Some(n);
+                    }
+                }
+            }
             "--list-accounts" => a.list_accounts = true,
             "--list-sessions" => a.list_sessions = true,
+            "--group-members" => a.group_members = true,
+            "--messages" => a.messages = true,
             "--pretty" => a.pretty = true,
             "--version" | "-V" => a.version = true,
             _ => {
@@ -624,8 +912,8 @@ fn main() {
 }
 
 fn run(args: Args) -> Result<()> {
-    if !args.list_accounts && !args.list_sessions {
-        bail!("必须指定模式：--list-accounts 或 --list-sessions（--version 查看用法）");
+    if !args.list_accounts && !args.list_sessions && !args.group_members && !args.messages {
+        bail!("必须指定模式：--list-accounts / --list-sessions / --group-members / --messages（--version 查看用法）");
     }
     let data_root = match &args.data_root {
         Some(r) if !r.trim().is_empty() => r.clone(),
@@ -637,13 +925,25 @@ fn run(args: Args) -> Result<()> {
     // 数据根存在性在这里闸一次（v1 main 同口径），后面的模式函数不必重复检查。
     let ks = KeyStore::load_default();
     // KeyStore::load_default 读 store_path()（--store 已注入环境变量）；
-    // store 损坏/不存在时降级为空库——空库会让 pick_current_account 报"没有密钥"，错误文案可操作。
+    // store 损坏/不存在时降级为空库——空库会让 pick_account_opened 报"没有密钥"，错误文案可操作。
     if args.list_accounts {
-        run_list_accounts(&ks, &data_root, args.pretty)
-    } else {
-        run_list_sessions(&ks, &data_root, args.account.as_deref(), args.pretty)
+        return run_list_accounts(&ks, &data_root, args.pretty);
     }
-    // 功能：模式派发（步骤 4/5 会加 --group-members/--messages/--voice 三个分支）。
+    if args.list_sessions {
+        return run_list_sessions(&ks, &data_root, args.account.as_deref(), args.pretty);
+    }
+    if args.group_members {
+        return run_group_members(
+            &ks, &data_root, args.account.as_deref(),
+            args.sid.as_deref().unwrap_or(""), args.pretty,
+        );
+    }
+    run_messages(
+        &ks, &data_root, args.account.as_deref(),
+        args.sid.as_deref().unwrap_or(""),
+        args.begin, args.end, args.recent, args.pretty,
+    )
+    // 功能：模式派发（--voice 在步骤 5 加入）。
 }
 
 #[cfg(test)]
@@ -700,5 +1000,48 @@ mod tests {
         assert!(is_session_db(Path::new("D:/x/session/session.db")));
         assert!(!is_session_db(Path::new("D:/x/session/contact.db")));
         // 功能：load_names 展示名分流依据（session_display vs nickname）的判据锚点。
+    }
+
+    #[test]
+    fn zstd_decode_hex_rejects_non_zstd() {
+        // 非法输入四类：空串、奇数长度、非 hex 字符、非 zstd 魔数——全部 None。
+        assert_eq!(zstd_decode_hex(""), None);
+        assert_eq!(zstd_decode_hex("abc"), None);            // 奇数长度
+        assert_eq!(zstd_decode_hex("zzzz"), None);           // 非 hex 字符
+        let plain_hex: String = "hello world 明文XML".bytes().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(zstd_decode_hex(&plain_hex), None);       // 是合法 hex 但魔数不是 zstd 帧
+        // 实现：前置校验（空/奇数/非hex）+ zstd 帧魔数（28 B5 2F FD）两道闸。
+        // 解析：明文 XML（type 1/47/49 正文）必须原样保留，绝不能被这里误"解码"——
+        //       测试用真实明文的 hex 化形态钉住"非 zstd → None"分支。
+        // 功能：防止渲染层拿到被破坏的正文。
+    }
+
+    #[test]
+    fn parse_args_messages_flags() {
+        let a = parse_args(&[
+            "--data-root".into(), "D:/r".into(),
+            "--messages".into(), "--sid".into(), "wxid_x@chatroom".into(),
+            "--begin".into(), "1700000000".into(), "--end".into(), "1700009999".into(),
+        ]);
+        assert!(a.messages && a.group_members == false);
+        assert_eq!(a.sid.as_deref(), Some("wxid_x@chatroom"));
+        assert_eq!(a.begin, 1700000000);
+        assert_eq!(a.end, 1700009999);
+        assert_eq!(a.recent, None);
+        // 实现：--messages 路径的参数解析。
+        // 功能：时间窗模式（begin/end，0=不限）与 recent 互斥取数的入口参数锚点。
+    }
+
+    #[test]
+    fn parse_args_recent_mode() {
+        let a = parse_args(&[
+            "--data-root".into(), "D:/r".into(),
+            "--messages".into(), "--sid".into(), "wxid_x".into(),
+            "--recent".into(), "200".into(),
+        ]);
+        assert_eq!(a.recent, Some(200));
+        assert_eq!(a.begin, 0); // recent 模式下 begin/end 应保持 0（未传）
+        // 实现：--recent 解析成 usize；非法值保持 None（退回时间窗路径）。
+        // 功能：最近 N 条模式的参数锚点。
     }
 }
