@@ -20,7 +20,7 @@ from datetime import datetime
 from pathlib import Path
 
 from . import exporter, outfile, render, session, voice
-from .config import Config
+from .config import Config, ConfigError, load_config
 
 # 实现：import 同包四模块与 Config。
 # 功能：编排层全部依赖。
@@ -215,3 +215,50 @@ def _write(fmt: str, path: Path, records: list[dict]) -> None:
     # 实现：csv/json 覆盖写直通；jsonl 明确拒绝。
     # 解析：明确报错优于静默写出一个既像 JSON 又不是数组的文件。
     # 功能：格式分发。
+
+
+def main(argv=None) -> int:
+    """面板启动入口（start_panel.bat 调用）：加载配置 → 起本地面板服务（阻塞）。
+
+    用法：python -m wxmsg.cli [--port 8765]
+    必须以 -m 方式运行——cli.py 在 wxmsg 包内，直接按文件路径跑会破坏相对导入。
+    """
+    import sys
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except (AttributeError, ValueError):
+        pass  # 极旧解释器或已重定向的流没有 reconfigure——不致命（面板输出以浏览器为主）
+    # 实现：UTF-8 控制台（中文横幅/错误在 GBK 控制台不乱码，v1 panel.py 同款防护）。
+    argv = list(sys.argv[1:] if argv is None else argv)
+    port = 8765
+    if "--port" in argv:
+        i = argv.index("--port")
+        if i + 1 < len(argv):
+            try:
+                port = int(argv[i + 1])
+            except ValueError:
+                print(f"[用法错误] --port 需要数字端口，收到 {argv[i + 1]!r}")
+                return 2
+    try:
+        cfg = load_config()
+    except ConfigError as e:
+        print(f"[配置错误] {e}")
+        return 2
+    # panel 在函数内导入而非模块顶部：panel→cli 与 cli→panel 双向引用，顶层互导有初始化顺序风险，
+    # 函数内导入让两边都加载完成后再建立引用，稳妥且对正常使用无影响。
+    from . import panel
+    try:
+        panel.serve(cfg, port=port)
+    except OSError as e:
+        print(f"[启动失败] 端口 {port} 可能被占用（{e}）。换个端口试试：python -m wxmsg.cli --port 8766")
+        return 1
+    return 0
+    # 实现：UTF-8 防护 → --port 解析 → 配置硬闸 → 起面板。
+    # 解析：配置错误返回 2（bat 会 pause 让用户看到文案）；端口占用返回 1 并给换端口指引。
+    # 功能：双击入口的全部行为。
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+    # 功能：python -m wxmsg.cli 的执行入口。
