@@ -82,6 +82,24 @@ def session_filename(chat_type: int, display: str, fmt: str, now: datetime | Non
     # 功能：分文件模式的导出文件名。
 
 
+def realtime_filename(fmt: str, now: datetime | None = None) -> str:
+    """实时合并文件名：realtime_<时间戳>.<fmt>（实时模式选 JSON 时 fmt 已是 jsonl）。"""
+    _check_fmt(fmt)
+    return f"realtime_{timestamp_slug(now)}.{fmt}"
+    # 实现：固定前缀 + 时间戳。
+    # 功能：实时模式合并文件的命名（与历史导出的 chat_export_ 区分开）。
+
+
+def realtime_session_filename(chat_type: int, display: str, fmt: str,
+                              now: datetime | None = None) -> str:
+    """实时分文件名：实时_私聊_张三_<时间戳>.csv / 实时_群聊_前端群_<时间戳>.jsonl。"""
+    _check_fmt(fmt)
+    kind = "群聊" if chat_type == 0 else "私聊"
+    return f"实时_{kind}_{sanitize_name(display)}_{timestamp_slug(now)}.{fmt}"
+    # 实现：与 session_filename 同构，前缀"实时_"标识这是增量文件（后续每轮往里追加）。
+    # 功能：实时模式分文件的命名。
+
+
 def _check_fmt(fmt: str) -> None:
     if fmt not in FORMATS:
         raise ValueError(f"不支持的导出格式：{fmt}（可选 {'/'.join(FORMATS)}）")
