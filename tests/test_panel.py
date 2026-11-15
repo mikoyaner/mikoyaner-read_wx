@@ -32,6 +32,8 @@ def server(tmp_path, monkeypatch):
     srv = ThreadingHTTPServer(("127.0.0.1", 0), panel._Handler)
     srv.daemon_threads = True
     srv.app = panel.App(_cfg(tmp_path))
+    srv.app.search_history = panel.search_mod.SearchHistory(tmp_path / "history.json")
+    # 搜索历史重定向到 tmp——绝不污染真实项目 cache/search_history.json
     t = threading.Thread(target=srv.serve_forever, daemon=True)
     t.start()
     yield srv
@@ -165,51 +167,85 @@ class TestHttpApi:
         # 实现：/api/rescan 直通 keys.ensure_keys（重扫输出已过白名单闸）。
         # 功能：换号场景的手动重扫兜底按钮。
 
-    def test_match_endpoint(self, server, monkeypatch):
+    def test_search_priv_endpoint(self, server, monkeypatch):
         monkeypatch.setattr(panel.exporter, "list_sessions", lambda cfg, **kw: {"sessions": [
             {"sid": "wxid_zs", "is_group": False, "session_display": "", "remark": "张三",
              "nickname": "", "alias": "", "sort_ts": 1},
-            {"sid": "wxid_w", "is_group": False, "session_display": "", "remark": "",
-             "nickname": "王三金", "alias": "", "sort_ts": 2},
+            {"sid": "g1@chatroom", "is_group": True, "session_display": "", "remark": "",
+             "nickname": "张三群", "alias": "", "sort_ts": 2},
         ]})
-        out = _post(server, "/api/match", {"query": "张三"})
-        assert out["ok"] is True and out["unique"] is True
-        assert out["matches"][0]["sid"] == "wxid_zs" and out["matches"][0]["field"] == "备注"
-        out = _post(server, "/api/match", {"query": "三"})
-        assert out["ok"] is True and out["unique"] is False and len(out["matches"]) == 2
-        out = _post(server, "/api/match", {"query": "查无此人"})
-        assert out["matches"] == []
-        # 实现：/api/match 走 ranked_sessions（备注>微信号>昵称权重 + 三档程度）。
-        # 功能：按名字选择的后端协议（前端：唯一命中自动勾选，歧义列候选）。
+        out = _post(server, "/api/search_priv", {"query": "张三"})
+        assert out["ok"] is True
+        assert [r["sid"] for r in out["results"]] == ["wxid_zs"]   # 群被过滤（走群搜索行）
+        # 实现：/api/search_priv = search.search_privates + 历史词记录。
+        # 功能：第一行搜索的后端协议。
+
+    def test_search_group_endpoint(self, server, monkeypatch):
+        monkeypatch.setattr(panel.exporter, "list_sessions", lambda cfg, **kw: {"sessions": [
+            {"sid": "g1@chatroom", "is_group": True, "session_display": "", "remark": "",
+             "nickname": "前端群", "alias": "", "sort_ts": 2},
+        ]})
+        monkeypatch.setattr(panel.exporter, "group_members_all", lambda cfg, **kw: {"groups": [
+            {"sid": "g1@chatroom", "name": "前端群", "error": None, "members": [
+                {"username": "wxid_m", "group_display": None, "remark": "小明",
+                 "nickname": "", "alias": "", "source": "sender_pool"}]},
+        ]})
+        out = _post(server, "/api/search_group", {"query": "前端群"})
+        assert out["ok"] is True
+        assert out["results"][0]["kind"] == "group" and out["results"][0]["sid"] == "g1@chatroom"
+        out = _post(server, "/api/search_group", {"query": "小明"})
+        assert out["ok"] is True and out["results"][0]["kind"] == "member"
+        assert out["results"][0]["username"] == "wxid_m"
+        # 实现：/api/search_group 走懒构建索引 + search.search_groups（群在前成员在后）。
+        # 功能：第二行搜索的后端协议。
+
+    def test_history_endpoint(self, server):
+        out = _post(server, "/api/history", {"kind": "priv"})
+        assert out["ok"] is True and isinstance(out["terms"], list)
+        out = _post(server, "/api/history", {"kind": "bogus"})
+        assert out["ok"] is False
+        # 实现：/api/history 直通 SearchHistory.terms（坏类别 → ValueError → ok:false）。
+        # 功能：datalist 历史词读取。
 
     def test_realtime_lifecycle(self, server, monkeypatch):
+        """服务端后台线程生命周期：start 起线程 → 自动轮询累计 → stop 后彻底停。"""
+        import time
         started = {}
+        polls = {"n": 0}
         class FakeRT:
             def __init__(self, cfg, targets, **kw):
                 started["targets"] = targets
                 started["include_history"] = kw.get("include_history")
             def poll_once(self):
-                return {"new_total": 1, "sessions": [{"sid": "wxid_a", "display": "张三", "new": 1, "total": 1}], "at": "t"}
+                polls["n"] += 1
+                return {"new_total": 1, "sessions": [
+                    {"sid": "wxid_a", "display": "张三", "new": 1, "total": polls["n"]}],
+                    "at": "t"}
             def summary(self):
-                return {"running": True, "total": 1, "files": []}
+                return {"running": True, "total": polls["n"], "files": []}
         monkeypatch.setattr(panel.realtime_mod, "RealtimeExport", FakeRT)
         out = _post(server, "/api/realtime/start", {"targets": [
             {"sid": "wxid_a", "chat_type": 1, "display": "张三", "members": None}],
-            "fmt": "csv", "include_history": True})
-        assert out["ok"] is True and out["total"] == 1
+            "fmt": "csv", "include_history": True, "interval_s": 5})
+        assert out["ok"] is True
         assert started["include_history"] is True
-        out = _post(server, "/api/realtime/poll")
-        assert out["ok"] is True and out["new_total"] == 1
+        time.sleep(0.8)                                  # 线程先立即 poll 一次再进入等待
         out = _post(server, "/api/realtime/state")
-        assert out["running"] is True
+        assert out["ok"] is True and out["running"] is True
+        assert out["total"] >= 1                         # 服务端在跑（页面无关）
         out = _post(server, "/api/realtime/stop")
         assert out["ok"] is True and out["stopped"] is True
+        n_at_stop = polls["n"]
+        time.sleep(1.2)
+        assert polls["n"] == n_at_stop                   # 停止后不再轮询
         out = _post(server, "/api/realtime/state")
         assert out["ok"] is True and out["running"] is False
-        out = _post(server, "/api/realtime/poll")
-        assert out["ok"] is False and "没有正在运行" in out["error"]
-        # 实现：start（捕获 targets/include_history）→ poll → state → stop → 空态报错。
-        # 功能：实时生命周期协议（前端定时器按此驱动）。
+        out = _post(server, "/api/realtime/poll")        # 端点已随前端重构移除
+        assert out["ok"] is False and "未知接口" in out["error"]
+        # 实现：start 起后台线程（interval=1s）→ state 看到线程累计 → stop 置事件+join。
+        # 解析：用户拍板「服务端命令行驱动、页面关闭不影响」——线程在黑窗口进程里跑，
+        #       state 端点让重开的页面恢复运行状态显示。
+        # 功能：实时后台生命周期协议。
 
 
 class TestSetupMode:

@@ -27,8 +27,8 @@ import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from . import cli, exporter, keys, session as session_mod
-from .config import KEY_DATA_ROOT, Config, load_config, set_env_key
+from . import cli, exporter, keys, search as search_mod, session as session_mod
+from .config import KEY_DATA_ROOT, Config, load_config, project_root, set_env_key
 
 # 实现：import 标准库 HTTP 三件套 + 同包编排模块。
 # 解析：session 模块起名 session 与 http 的概念无冲突，但为可读性 import as session_mod。
@@ -103,8 +103,15 @@ class App:
         self.cfg = cfg
         self.lock = threading.Lock()
         self.rt = None
-        # 实现：cfg 允许 None——首次运行未配置数据根时进入 setup 模式（页面引导填路径生成 .env）。
-        # 解析：rt 单例（同一时刻只跑一个实时监听）；lock 串行化历史导出与实时启停。
+        self._rt_thread: threading.Thread | None = None
+        self._rt_stop: threading.Event | None = None
+        self._rt_error = ""
+        self._member_index = None          # 群·成员搜索索引（懒构建，刷新会话列表时失效）
+        self.search_history = search_mod.SearchHistory(
+            project_root() / "cache" / "search_history.json")
+        # 实现：cfg 允许 None（setup 模式）；rt 单例 + 后台线程/停止事件（实时监听服务端驱动）；
+        #       _member_index 懒缓存（--group-members-all 一次进程，避免每次搜索都扫全库）。
+        # 解析：搜索历史落 cache/（gitignore，含搜索词不算密钥但也不该入库）。
         # 功能：所有 /api 处理器的宿主状态。
 
     def setup(self, params: dict) -> dict:
@@ -138,18 +145,6 @@ class App:
         # 解析：这是自动重扫之外的手动兜底——换号自动重扫万一失败，用户点一下再试。
         # 功能：/api/rescan 的实现。
 
-    def match(self, query: str) -> dict:
-        """按名字模糊匹配会话（v1 ranked_matches 口径），供「按名字选择」。"""
-        if self.cfg is None:
-            raise ValueError("还未配置数据根")
-        exp = exporter.list_sessions(self.cfg)
-        sessions = session_mod.sessions_from_export(exp)
-        matches = session_mod.ranked_sessions(sessions, query)
-        return {"matches": matches, "unique": len(matches) == 1}
-        # 实现：匹配在全量会话（含公众号）上做——公众号也可能被想提取。
-        # 解析：unique 标记让前端"唯一命中自动勾选，歧义列候选"（v1 的交互语义）。
-        # 功能：/api/match 的数据源。
-
     def diagnose(self) -> dict:
         acc = exporter.list_accounts(self.cfg)
         return {
@@ -168,8 +163,44 @@ class App:
 
     def sessions(self) -> dict:
         exp = exporter.list_sessions(self.cfg)
+        self._member_index = None   # 刷新会话列表 = 成员索引一并失效重建（数据可能变化）
         return split_sessions(session_mod.sessions_from_export(exp))
-        # 功能：会话列表数据源。
+        # 实现：刷新时清空成员索引懒缓存——下次群搜索会重新拉 --group-members-all。
+        # 功能：会话列表数据源 + 索引失效点。
+
+    def _ensure_member_index(self) -> dict:
+        """懒构建群·成员搜索索引（一次 --group-members-all 进程，缓存到刷新为止）。"""
+        if self._member_index is None:
+            self._member_index = search_mod.build_member_index(
+                exporter.group_members_all(self.cfg))
+        return self._member_index
+        # 实现：None 即构建；索引里的 error/统计原样保留。
+        # 解析：构建成本 = 一次导出器进程（实测 47 群毫秒级），首次群搜索时付出。
+        # 功能：群搜索的数据入口。
+
+    def search_priv(self, query: str) -> dict:
+        """私聊搜索：备注/昵称/微信号匹配，公众号排除。搜索词记入历史。"""
+        exp = exporter.list_sessions(self.cfg)
+        sessions = session_mod.sessions_from_export(exp)
+        results = search_mod.search_privates(sessions, query)
+        self.search_history.add("priv", query)
+        return {"results": results}
+        # 功能：第一行搜索的 API 数据源。
+
+    def search_group(self, query: str) -> dict:
+        """群搜索：群名 + 群·成员组合（群在前成员在后）。搜索词记入历史。"""
+        index = self._ensure_member_index()
+        exp = exporter.list_sessions(self.cfg)
+        sessions = session_mod.sessions_from_export(exp)
+        results = search_mod.search_groups(index, sessions, query)
+        self.search_history.add("group", query)
+        return {"results": results}
+        # 功能：第二行搜索的 API 数据源。
+
+    def history(self, kind: str) -> dict:
+        """某类搜索的历史词（datalist 联想数据源）。"""
+        return {"terms": self.search_history.terms(kind)}
+        # 功能：搜索历史读取。
 
     def members(self, sid: str) -> dict:
         if not sid.strip():
@@ -198,12 +229,20 @@ class App:
         # 功能：历史导出 API。
 
     def realtime_start(self, params: dict) -> dict:
+        """启动实时监听：构建 RealtimeExport 并起**服务端后台线程**轮询。
+
+        线程驱动（用户拍板：服务端命令行驱动、页面关闭不影响）：黑窗口常驻期间，
+        每隔 interval_s 自动 poll_once 并追加落盘，直到 /api/realtime/stop 置停止事件。"""
         fmt = str(params.get("fmt") or "csv")
         if fmt not in REALTIME_FORMATS:
             raise ValueError(f"实时模式只支持 {'/'.join(REALTIME_FORMATS)}")
+        interval_s = int(params.get("interval_s") or self.cfg.poll_interval_s)
+        if interval_s < 5:
+            raise ValueError("轮询间隔最小 5 秒")
         with self.lock:
             if self.rt is not None:
                 raise ValueError("已有实时监听在运行——请先停止再重新开始")
+            self._rt_error = ""
             self.rt = realtime_mod.RealtimeExport(
                 self.cfg, _targets_from_params(params), fmt=fmt,
                 merged=bool(params.get("merged", True)),
@@ -212,32 +251,56 @@ class App:
                 history_end=cli.parse_time_boundary(params.get("history_end"), end_of_day=True),
                 history_recent=params.get("history_recent"),
             )
+            self._rt_stop = threading.Event()
+            self._rt_thread = threading.Thread(
+                target=self._rt_loop, args=(self.rt, self._rt_stop, interval_s),
+                daemon=True, name="realtime-poll")
+            self._rt_thread.start()
             return self.rt.summary()
-        # 实现：单例闸（先停再开）；构造即完成起点导出（include_history 时含历史）。
-        # 功能：实时监听的启动 API。
-        # （realtime_mod 在文件底部 import——避免与下方模块级命名冲突的循环依赖。）
+        # 实现：单例闸 → 构建状态机（含起点导出）→ 起守护线程。
+        # 解析：daemon 线程随黑窗口退出而终止（Ctrl+C = 全停）；interval 下限 5 秒
+        #       与 config 口径一致。页面关闭不影响线程（这就是服务端驱动的意义）。
+        # 功能：实时监听的启动 API（后台化改造）。
 
-    def realtime_poll(self) -> dict:
-        with self.lock:
-            if self.rt is None:
-                raise ValueError("没有正在运行的实时监听")
-            result = self.rt.poll_once()
-            return {**result, "summary": self.rt.summary()}
-        # 功能：前端定时器每分钟调用一次。
+    def _rt_loop(self, rt, stop_event: threading.Event, interval_s: int) -> None:
+        """实时线程主循环：poll → 打一行摘要（不含消息内容）→ 等间隔或停止事件。"""
+        while not stop_event.is_set():
+            try:
+                result = rt.poll_once()
+                self._rt_error = ""
+                print(f"[realtime] {result['at']} 新增 {result['new_total']} 条 "
+                      f"（累计 {sum(s['total'] for s in result['sessions'])}）")
+            except Exception as e:  # noqa: BLE001  轮询失败不退出循环——下一轮可能自愈
+                self._rt_error = f"{type(e).__name__}: {e}"
+                print(f"[realtime] 轮询失败（下一轮重试）：{self._rt_error}")
+            if stop_event.wait(interval_s):
+                break
+        # 实现：poll 异常被捕获记录（面板 state 里可见），循环继续——换号自动重扫等
+        #       自愈逻辑在 exporter 层，这里只兜底"彻底失败"的场景。
+        # 解析：stop_event.wait(interval) 同时实现"间隔睡眠"与"即时响应停止"；
+        #       摘要只打条数不打内容（黑窗口可能被投屏/旁观）。
+        # 功能：服务端驱动的实时轮询循环。
 
     def realtime_state(self) -> dict:
         with self.lock:
             if self.rt is None:
-                return {"running": False}
-            return {"running": True, **self.rt.summary()}
-        # 功能：页面刷新后恢复实时状态显示。
+                return {"running": False, "last_error": self._rt_error}
+            return {"running": True, "last_error": self._rt_error, **self.rt.summary()}
+        # 功能：页面（重新打开后）恢复实时状态：运行中/累计条数/最近错误。
 
     def realtime_stop(self) -> dict:
         with self.lock:
             had = self.rt is not None
+            if self._rt_stop is not None:
+                self._rt_stop.set()
+            if self._rt_thread is not None:
+                self._rt_thread.join(timeout=3)
+            self._rt_thread = None
+            self._rt_stop = None
             self.rt = None
             return {"stopped": had}
-        # 实现：置空单例即停止（文件已落盘的内容不受影响）。
+        # 实现：置停止事件 → join 线程（最多等 3 秒）→ 清状态（文件已落盘内容不受影响）。
+        # 解析：join 有超时——线程若卡在长轮询里也不拖死 API 响应；事件置位后下一轮必退。
         # 功能：停止实时监听 API。
 
 
@@ -282,14 +345,16 @@ class _Handler(BaseHTTPRequestHandler):
                 return {"ok": True, **app.sessions()}
             if name == "members":
                 return {"ok": True, **app.members(str(params.get("sid") or ""))}
-            if name == "match":
-                return {"ok": True, **app.match(str(params.get("query") or ""))}
+            if name == "search_priv":
+                return {"ok": True, **app.search_priv(str(params.get("query") or ""))}
+            if name == "search_group":
+                return {"ok": True, **app.search_group(str(params.get("query") or ""))}
+            if name == "history":
+                return {"ok": True, **app.history(str(params.get("kind") or ""))}
             if name == "export":
                 return {"ok": True, **app.export(params)}
             if name == "realtime/start":
                 return {"ok": True, **app.realtime_start(params)}
-            if name == "realtime/poll":
-                return {"ok": True, **app.realtime_poll()}
             if name == "realtime/state":
                 return {"ok": True, **app.realtime_state()}
             if name == "realtime/stop":
@@ -350,59 +415,74 @@ PAGE = """<!DOCTYPE html>
 <html lang="zh"><head><meta charset="utf-8">
 <title>微信聊天记录提取</title>
 <style>
- body{font-family:"Microsoft YaHei",sans-serif;max-width:1100px;margin:0 auto;padding:12px;color:#222}
- h1{font-size:20px} h2{font-size:15px;margin:8px 0 4px}
+ body{font-family:"Microsoft YaHei",sans-serif;max-width:1150px;margin:0 auto;padding:12px;color:#222}
+ h1{font-size:20px} h2{font-size:15px;margin:8px 0 4px} h3{font-size:14px;margin:6px 0 4px}
  section{border:1px solid #ddd;border-radius:8px;padding:10px;margin:10px 0}
- .cols{display:flex;gap:12px} .cols>div{flex:1;border-right:1px dashed #eee;padding-right:8px}
- .cols>div:last-child{border-right:none}
- .row{padding:2px 0;font-size:13px} .row label{cursor:pointer}
- .meta{color:#888;font-size:11px;margin-left:4px}
- button{padding:4px 14px;margin-right:8px;cursor:pointer}
- .err{color:#c00;white-space:pre-wrap} .ok{color:#070}
- #memberBox .grp{border:1px solid #eee;border-radius:6px;padding:6px;margin:6px 0;background:#fafafa}
+ .cols{display:flex;gap:12px} .cols>div{flex:1;border:1px dashed #e5e5e5;border-radius:6px;padding:8px}
+ input,select{font-size:13px;padding:3px} select{width:100%}
+ button{padding:3px 12px;margin:2px 2px 2px 0;cursor:pointer}
+ .row{padding:2px 0;font-size:13px}
+ .meta{color:#888;font-size:11px}
+ .err{color:#c00;white-space:pre-wrap} .ok{color:#070} .muted{color:#999;font-size:12px}
  table{border-collapse:collapse;font-size:12px} td,th{border:1px solid #ccc;padding:3px 8px;text-align:left}
- .muted{color:#999;font-size:12px}
+ #rtStatus b{color:#06c}
 </style></head><body>
 <h1>微信聊天记录提取</h1>
 
 <section>
  <b>① 体检</b> <button onclick="diagnose()">开始体检</button>
  <button onclick="rescanKeys()">重扫密钥</button>
- <div id="statusBox" class="muted">先体检：确认数据根、导出器、密钥状态。换号登录后点「重扫密钥」再「刷新会话列表」。</div>
+ <button onclick="loadSessions()">刷新会话数据</button>
+ <div id="statusBox" class="muted">先体检；换号登录后点「重扫密钥」再「刷新会话数据」。</div>
 </section>
 
 <section>
- <b>② 选择会话</b>（导出/实时都用这里的勾选）
- <button onclick="loadSessions()">刷新会话列表</button>
+ <b>② 选择会话</b>（两种模式共用；每行：搜索 → 结果列表（Ctrl 多选）→ 确认添加 → 已选列表 → 删除选择）
  <div class="cols">
-  <div><h2>私聊</h2><div id="privList" class="muted">先体检再刷新</div></div>
-  <div><h2>群聊</h2><div id="grpList" class="muted">先体检再刷新</div></div>
-  <div><h2>公众号 <label class="meta"><input type="checkbox" id="showOfficial" onchange="renderSessions()">显示</label></h2>
-   <div id="offList" class="muted"></div></div>
+  <div>
+   <h2>私聊搜索</h2>
+   <input id="privSearch" list="privHist" placeholder="备注 / 昵称 / 微信号" style="width:60%">
+   <datalist id="privHist"></datalist>
+   <button onclick="doSearch('priv')">搜索</button>
+   <div class="meta">结果（Ctrl 可多选）</div>
+   <select id="privResults" size="7" multiple></select>
+   <button onclick="addFromResults('priv')">确认添加 →</button>
+   <div class="meta">已选会话</div>
+   <select id="privSel" size="7" multiple></select>
+   <button onclick="delSelected('priv')">删除选择</button>
+   <div><label id="privCount" class="meta"></label></div>
+  </div>
+  <div>
+   <h2>群聊搜索（群名 + 群内成员）</h2>
+   <input id="grpSearch" list="grpHist" placeholder="群名 / 成员备注 / 昵称 / 微信号" style="width:60%">
+   <datalist id="grpHist"></datalist>
+   <button onclick="doSearch('grp')">搜索</button>
+   <div class="meta">结果（群在前、群·成员在后；Ctrl 可多选）</div>
+   <select id="grpResults" size="7" multiple></select>
+   <button onclick="addFromResults('grp')">确认添加 →</button>
+   <div class="meta">已选会话</div>
+   <select id="grpSel" size="7" multiple></select>
+   <button onclick="delSelected('grp')">删除选择</button>
+   <div><label id="grpCount" class="meta"></label></div>
+  </div>
  </div>
- <div id="memberBox"></div>
- <div class="muted">群聊勾选后出现「成员」按钮：不点=导全群；点开后可勾选成员，只导被选成员的消息。</div>
- <div style="border:1px dashed #ccd;border-radius:6px;padding:6px;margin-top:6px;background:#f5f8ff">
-  <b>按名字选择</b>（模糊匹配备注/昵称/微信号/群名）：
-  <input id="matchQuery" placeholder="如：张三 / 三哥 / zhangsan" style="width:240px">
-  <button onclick="matchName()">匹配</button>
-  <div id="matchResult" class="muted">唯一命中自动勾选；有歧义列候选让你点选。</div>
- </div>
+ <div class="muted">选择「群」= 导出该群全部成员的消息；选择「群·某成员」= 只导出该成员的消息（标注「发言者池」= 来自该群最近消息的发言人，非完整名册）。每个列表最多 20 个。</div>
 </section>
 
 <section>
  <b>③ 模式与格式</b>
  <div>
-  <label><input type="radio" name="mode" value="history" checked onchange="modeChanged()">历史导出</label>
-  <label><input type="radio" name="mode" value="realtime" onchange="modeChanged()">实时监听（每分钟增量追加）</label>
+  <label><input type="radio" name="mode" value="history" checked onchange="modeChanged()">历史导出（一次性任务，导完即止）</label>
+  <label><input type="radio" name="mode" value="realtime" onchange="modeChanged()">实时监听（服务端后台每分钟提取，直到按「停止运行」）</label>
  </div>
  <div id="historyOpts">
   时间范围：<input type="date" id="begin"> ~ <input type="date" id="end">
-  或最近 <input type="number" id="recent" min="1" style="width:80px"> 条（两者都留空 = 全部历史）
+  或最近 <input type="number" id="recent" min="1" style="width:80px"> 条（都留空 = 全部历史）
  </div>
  <div id="realtimeOpts" style="display:none">
-  <label><input type="checkbox" id="includeHistory">同时导出历史消息（写进同一个实时文件）</label>
-  （导历史时可叠加下方时间范围/最近N）
+  <label><input type="checkbox" id="includeHistory">启动时同时导出历史消息（写进同一个实时文件）</label>
+  （可叠加下方时间范围/最近N）
+  <div class="muted">启动后：黑窗口每分钟提取一次，<b>关闭浏览器页面不影响</b>；重新打开面板能看到运行状态。</div>
  </div>
  <div style="margin-top:6px">
   格式 <select id="fmt"><option value="csv">CSV（Excel）</option><option value="json">JSON（实时=JSONL追加）</option></select>
@@ -412,133 +492,128 @@ PAGE = """<!DOCTYPE html>
  </div>
  <div style="margin-top:8px">
   <button id="exportBtn" onclick="doExport()">开始导出</button>
-  <button id="rtBtn" onclick="rtToggle()">开始实时监听</button>
+  <button id="rtBtn" onclick="rtToggle()" style="display:none">开始实时监听</button>
+  <button id="rtStopBtn" onclick="rtStop()" style="display:none">停止运行</button>
  </div>
+ <div id="rtStatus"></div>
  <div id="result" class="muted">导出/实时结果会显示在这里</div>
 </section>
 
 <script>
-const S = {sessions: [], meta: {}, members: {}, timer: null, running: false};
+const S = {privResults:[], grpResults:[], privTargets:[], grpTargets:[],
+           rtTimer:null, rtRunning:false};
+const SEL_CAP = 20;
 function esc(s){return String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));}
+function show(el,ok,text){ el.className=ok?"ok":"err"; el.textContent=text; }
 async function api(name, params={}){
   try{
     const r = await fetch("/api/"+name,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(params)});
     return await r.json();
   }catch(e){
-    // 网络层失败（服务关掉/控制台被关）就地报错——绝不让页面停在"等待中"
     return {ok:false,error:"无法连接面板服务：请确认黑色控制台窗口还开着（关了就重新双击 start_panel.bat）"};
   }
 }
-function show(el, ok, text){ el.className = ok?"ok":"err"; el.textContent = text; }
 
+/* —— ① 体检 —— */
 async function diagnose(){
   const box = document.getElementById("statusBox");
   box.textContent = "体检中…";
   const d = await api("diagnose");
   if(!d.ok){ show(box,false,"体检失败："+d.error); return; }
-  const acc = d.accounts.map(a=>`${esc(a.wxid||a.account_dir)}（${a.key_works?"密钥可用":a.has_key?"密钥失效":"无密钥"}，${a.session_db_age_s<0?"?" :Math.round(a.session_db_age_s/60)} 分钟前活跃）`).join("；");
+  const acc = d.accounts.map(a=>`${esc(a.wxid||a.account_dir)}（${a.key_works?"密钥可用":a.has_key?"密钥失效":"无密钥"}，${a.session_db_age_s<0?"?":Math.round(a.session_db_age_s/60)} 分钟前活跃）`).join("；");
   show(box,true,`数据根 ${d.data_root} ✓ ｜ 导出器 ${d.exporter_exists?"就绪":"缺失(需先编译)"} ｜ ASR ${d.asr_available?"可用":"不可用(语音将显示[语音])"} ｜ 账号：${acc||"无"}`);
-  loadSessions();
 }
 async function rescanKeys(){
   const box = document.getElementById("statusBox");
   box.textContent = "重扫密钥中（只读扫微信进程内存，约几十秒；微信需保持登录）…";
   const d = await api("rescan");
   if(!d.ok){ show(box,false,"重扫失败："+((d.lines||[]).join(" | ")||d.error)); return; }
-  show(box,true,"重扫完成。"+(d.lines||[]).join(" | ")+"——请点「刷新会话列表」加载当前登录号的会话");
-}
-
-function sessRow(s){
-  const c = `<input type="checkbox" class="sess" data-sid="${esc(s.sid)}" data-type="${s.sid.endsWith("@chatroom")?0:1}" data-display="${esc(s.display)}">`;
-  return `<div class="row"><label>${c} ${esc(s.display)}<span class="meta">${esc(s.sid)}</span></label>
-    ${s.sid.endsWith("@chatroom")?`<button class="meta" onclick="loadMembers('${esc(s.sid)}')">成员</button>`:""}</div>`;
+  show(box,true,"重扫完成。"+(d.lines||[]).join(" | ")+"——请点「刷新会话数据」");
 }
 async function loadSessions(){
+  const box = document.getElementById("statusBox");
   const d = await api("sessions");
-  if(!d.ok){ show(document.getElementById("privList"),false,d.error); return; }
-  S.sessions = [...d.groups,...d.privates,...d.official];
-  S.meta = {}; S.sessions.forEach(s=>S.meta[s.sid]=s);
-  renderSessions();
+  if(!d.ok){ show(box,false,"刷新失败："+d.error); return; }
+  show(box,true,"会话数据已刷新（含群成员索引，下次群搜索时按需加载）。");
 }
-function renderSessions(){
-  const g=filterList("groups"),p=filterList("privates"),o=filterList("official");
-  document.getElementById("grpList").innerHTML = g||'<div class="muted">（无）</div>';
-  document.getElementById("privList").innerHTML = p||'<div class="muted">（无）</div>';
-  document.getElementById("offList").innerHTML = o||'<div class="muted">（无或未显示）</div>';
+
+/* —— ② 搜索与选择 —— */
+async function refreshHistory(kind){
+  const d = await api("history",{kind});
+  const dl = document.getElementById(kind+"Hist");
+  dl.innerHTML = (d.ok?d.terms:[]).map(t=>`<option value="${esc(t)}">`).join("");
 }
-function filterList(kind){
-  const showOff = document.getElementById("showOfficial").checked;
-  if(kind==="official" && !showOff) return "";
-  return (S.meta?Object.values(S.meta):[]).filter(s=>
-    kind==="groups"?s.sid.endsWith("@chatroom"):
-    kind==="official"?s.sid.startsWith("gh_"):
-    (!s.sid.endsWith("@chatroom") && !s.sid.startsWith("gh_")))
-    .map(sessRow).join("");
-}
-async function matchName(){
-  const q=document.getElementById("matchQuery").value.trim();
-  const el=document.getElementById("matchResult");
-  if(!q){ el.textContent="请输入名字"; return; }
-  const d=await api("match",{query:q});
-  if(!d.ok){ show(el,false,d.error); return; }
-  if(!d.matches.length){ show(el,false,"没有匹配到任何联系人/群聊"); return; }
-  if(d.unique){
-    checkSid(d.matches[0].sid);
-    el.innerHTML=`<span class="ok">唯一命中：${esc(d.matches[0].display)}（${esc(d.matches[0].field)}）✓ 已在列表中勾选</span>`;
-    return;
-  }
-  el.innerHTML=`歧义：命中 ${d.matches.length} 个（点选即勾选）<br>`+
-    d.matches.map((m,i)=>`<label class="row" style="cursor:pointer;display:block">`+
-      `<input type="radio" name="matchPick" onclick="checkSid('${esc(m.sid)}')"> `+
-      `${i+1}. ${esc(m.display)}（${esc(m.field)}）<span class="meta">${esc(m.sid)}</span></label>`).join("");
-  // 实现：唯一命中直接勾选并高亮；歧义列候选（带命中字段与 sid），点选即勾选。
-  // 解析：v1 的「选编号」交互在网页里自然变成"点选"；候选来自 ranked_sessions 的降序列表。
-}
-function checkSid(sid){
-  const cb=document.querySelector(`input.sess[data-sid="${CSS.escape(sid)}"]`);
-  if(!cb) return false;
-  cb.checked=true;
-  const row=cb.closest(".row");
-  if(row){
-    row.style.background="#fff3cd";
-    row.scrollIntoView({block:"center"});
-    setTimeout(()=>{row.style.background="";},1600);
-  }
-  return true;
-  // 实现：按 sid 找到列表里的复选框勾选，滚动到位并高亮 1.6s（CSS.escape 防 sid 含特殊字符）。
-}
-async function loadMembers(sid){
-  if(document.getElementById("mb_"+btoa(unescape(encodeURIComponent(sid))))) { return; }
-  const d = await api("members",{sid});
+async function doSearch(kind){
+  const q = document.getElementById(kind+"Search").value.trim();
+  const el = document.getElementById(kind+"Results");
+  if(!q){ alert("请输入搜索词"); return; }
+  const d = await api(kind==="priv"?"search_priv":"search_group",{query:q});
   if(!d.ok){ alert(d.error); return; }
-  const box = document.getElementById("memberBox");
-  const div = document.createElement("div");
-  div.className="grp"; div.id="mb_"+btoa(unescape(encodeURIComponent(sid)));
-  const checks = d.members.map(m=>`<label style="margin-right:10px"><input type="checkbox" class="mem" data-sid="${esc(sid)}" value="${esc(m.username)}"> ${esc(m.display)}${m.group_display?`<span class="meta">(${esc(m.group_display)})</span>`:""}</label>`).join("");
-  div.innerHTML = `<b>${esc(S.meta[sid]?.display||sid)}</b> 成员限定：
-    <label><input type="checkbox" class="memLimited" data-sid="${esc(sid)}">启用（不勾=导全群）</label><br>${checks||"（成员列表为空）"}`;
-  box.appendChild(div);
+  S[kind+"Results"] = d.results;
+  el.innerHTML = d.results.map((r,i)=>{
+    const tag = kind==="priv" ? `（${esc(r.field)}）`
+      : r.kind==="group" ? `（群，导全部）`
+      : `（${esc(r.field)}，只导该成员${r.source==="sender_pool"?"，发言者池":""}）`;
+    return `<option value="${i}">${esc(r.display)}${tag}</option>`;
+  }).join("") || `<option disabled>（没有匹配）</option>`;
+  refreshHistory(kind);   // 搜索词已入历史，同步 datalist
+}
+function addFromResults(kind){
+  const el = document.getElementById(kind+"Results");
+  const picks = [...el.selectedOptions].map(o=>S[kind+"Results"][+o.value]).filter(Boolean);
+  if(!picks.length){ alert("请先在结果列表里选中（可 Ctrl 多选）再点确认添加"); return; }
+  const targets = S[kind+"Targets"];
+  let added=0, dup=0;
+  for(const r of picks){
+    const key = kind==="priv" ? r.sid : r.sid+"|"+(r.username||"");
+    if(targets.some(t=>t.key===key)){ dup++; continue; }
+    if(targets.length >= SEL_CAP){ alert(`最多只能选 ${SEL_CAP} 个（当前列表已满）`); break; }
+    targets.push(kind==="priv"
+      ? {key:r.sid, sid:r.sid, chat_type:1, display:r.display, username:null}
+      : {key:r.sid+"|"+(r.username||""), sid:r.sid, chat_type:0,
+         display:r.display, username:(r.kind==="member"?r.username:null),
+         member_display:(r.kind==="member"?r.member_display:null)});
+    added++;
+  }
+  renderSel(kind);
+  if(added && dup) alert(`已添加 ${added} 个；${dup} 个重复跳过`);
+  else if(added) show(document.getElementById(kind+"Count"),true,`已添加 ${added} 个`);
+}
+function delSelected(kind){
+  const el = document.getElementById(kind+"Sel");
+  const picks = [...el.selectedOptions].map(o=>+o.value);
+  if(!picks.length){ alert("请先在已选列表里选中要删除的条目"); return; }
+  S[kind+"Targets"] = S[kind+"Targets"].filter((_,i)=>!picks.includes(i));
+  renderSel(kind);
+}
+function renderSel(kind){
+  const sel = document.getElementById(kind+"Sel");
+  sel.innerHTML = S[kind+"Targets"].map(t=>{
+    const tag = kind==="priv" ? "（私聊）"
+      : t.username ? `（群·${esc(t.member_display||t.username)}）` : "（群，全部成员）";
+    return `<option value="${esc(t.key)}">${esc(t.display)}${tag}</option>`;
+  }).join("");
+  document.getElementById(kind+"Count").textContent =
+    `最多 ${SEL_CAP} 个（当前 ${S[kind+"Targets"].length}/${SEL_CAP}）`;
 }
 function collectTargets(){
   const targets=[];
-  document.querySelectorAll("input.sess:checked").forEach(cb=>{
-    const sid=cb.dataset.sid;
-    let members=null;
-    const lim=document.querySelector(`.memLimited[data-sid="${CSS.escape(sid)}"]`);
-    if(lim && lim.checked){
-      members=[...document.querySelectorAll(`input.mem[data-sid="${CSS.escape(sid)}"]:checked`)].map(x=>x.value);
-      if(!members.length){ throw new Error(`群「${S.meta[sid]?.display||sid}」启用了成员限定但一个成员都没勾`);}
-    }
-    targets.push({sid, chat_type:+cb.dataset.type, display:cb.dataset.display, members});
-  });
+  for(const t of S.privTargets)
+    targets.push({sid:t.sid, chat_type:1, display:t.display, members:null});
+  for(const t of S.grpTargets)
+    targets.push({sid:t.sid, chat_type:0, display:t.display,
+                  members:(t.username?[t.username]:null)});
+  if(!targets.length) throw new Error("还没有选择任何会话：请先在②区搜索并「确认添加」");
   return targets;
 }
+
+/* —— ③ 模式与格式 —— */
 function modeChanged(){
   const rt=document.querySelector('input[name=mode][value=realtime]').checked;
   document.getElementById("historyOpts").style.display=rt?"none":"block";
   document.getElementById("realtimeOpts").style.display=rt?"block":"none";
-  document.getElementById("rtBtn").style.display=rt?"inline-block":"none";
   document.getElementById("exportBtn").style.display=rt?"none":"inline-block";
+  document.getElementById("rtBtn").style.display=rt?"inline-block":"none";
 }
 function commonParams(){
   return {targets:collectTargets(), fmt:document.getElementById("fmt").value,
@@ -551,45 +626,62 @@ function timeParams(){
 }
 async function doExport(){
   const el=document.getElementById("result");
+  let params;
+  try{ params={...commonParams(),...timeParams()}; }catch(e){ show(el,false,e.message); return; }
   el.textContent="导出中…（大会话可能要等一会）";
-  try{
-    const d=await api("export",{...commonParams(),...timeParams()});
-    if(!d.ok){ show(el,false,"导出失败："+d.error); return; }
-    renderFiles(el,d);
-  }catch(e){ show(el,false,e.message); }
-}
-function renderFiles(el,d){
+  const d=await api("export",params);
+  if(!d.ok){ show(el,false,"导出失败："+d.error); return; }
   const rows=d.files.map(f=>`<tr><td>${esc(f.display)}</td><td>${f.count}</td><td>${esc(f.path)}</td></tr>`).join("");
   const warn=d.warnings&&d.warnings.length?`<div class="err">注意：${d.warnings.map(esc).join("<br>")}</div>`:"";
-  el.innerHTML=`<div class="ok">完成，共 ${d.total} 条</div><table><tr><th>会话</th><th>条数</th><th>文件</th></tr>${rows}</table>${warn}`;
+  el.innerHTML=`<div class="ok">导出完成，共 ${d.total} 条。历史导出是一次性任务，到这里就结束了。</div>`+
+    `<table><tr><th>会话</th><th>条数</th><th>文件</th></tr>${rows}</table>${warn}`;
 }
+
+/* —— 实时监听（服务端后台驱动） —— */
 async function rtToggle(){
-  const btn=document.getElementById("rtBtn");
-  if(S.running){ await api("realtime/stop"); stopTimer(); show(document.getElementById("result"),true,"实时监听已停止（已写入的文件保留）"); return; }
-  const p=commonParams();
-  p.include_history=document.getElementById("includeHistory").checked;
-  if(p.include_history){ Object.assign(p,timeParams()); }
-  const el=document.getElementById("result");
-  const d=await api("realtime/start",p);
-  if(!d.ok){ show(el,false,"启动失败："+d.error); return; }
-  S.running=true; btn.textContent="停止实时监听";
-  const interval=Math.max(5,+document.getElementById("pollInterval").value||60)*1000;
-  S.timer=setInterval(rtPoll,interval);
-  el.innerHTML=`<div class="ok">实时监听已启动（每 ${interval/1000}s 一轮），结果持续追加：</div><div id="rtLog"></div>`;
-  rtPoll();
+  if(S.rtRunning){ await rtStop(); return; }
+  const el=document.getElementById("result"), st=document.getElementById("rtStatus");
+  let params;
+  try{ params=commonParams(); }catch(e){ show(el,false,e.message); return; }
+  params.fmt=document.getElementById("fmt").value;
+  params.merged=document.querySelector('input[name=org][value=merged]').checked;
+  params.include_history=document.getElementById("includeHistory").checked;
+  if(params.include_history){ Object.assign(params,timeParams()); }
+  params.interval_s=+document.getElementById("pollInterval").value||60;
+  st.textContent="启动中…";
+  const d=await api("realtime/start",params);
+  if(!d.ok){ show(st,false,"启动失败："+d.error); return; }
+  S.rtRunning=true;
+  document.getElementById("rtBtn").style.display="none";
+  document.getElementById("rtStopBtn").style.display="inline-block";
+  el.innerHTML=`<div class="ok">实时监听已启动（服务端后台每 ${params.interval_s}s 提取一次，关页面不影响）。</div>`;
+  rtRefresh(); S.rtTimer=setInterval(rtRefresh,10000);
 }
-async function rtPoll(){
-  const d=await api("realtime/poll");
-  const log=document.getElementById("rtLog");
-  if(!d.ok){ stopTimer(); if(log) show(log,false,"轮询失败："+d.error); return; }
-  if(log){
-    const lines=d.sessions.map(s=>`${esc(s.display)} +${s.new}（累计 ${s.total}）`).join("；");
-    log.innerHTML=`<div class="meta">${esc(d.at)} ${lines}</div>`+log.innerHTML;
-  }
+async function rtRefresh(){
+  const st=document.getElementById("rtStatus");
+  const d=await api("realtime/state");
+  if(!d.ok){ st.textContent=""; return; }
+  if(!d.running){ st.innerHTML=`<span class="ok">已停止（已写入的文件保留）</span>`; stopTimerUI(); return; }
+  const files=(d.files||[]).map(f=>esc(f.path)).join("<br>");
+  st.innerHTML=`<b>运行中</b>（累计 ${d.total} 条，最近轮询 ${esc(d.last_poll||"")}）`+
+    (d.last_error?`<div class="err">最近一次轮询出错：${esc(d.last_error)}（每轮自动重试）</div>`:"")+
+    `<div class="meta">文件：<br>${files}</div>`;
 }
-function stopTimer(){ if(S.timer){clearInterval(S.timer);S.timer=null;} S.running=false;
-  document.getElementById("rtBtn").textContent="开始实时监听"; }
+async function rtStop(){
+  const d=await api("realtime/stop");
+  stopTimerUI();
+  if(d.ok){ show(document.getElementById("rtStatus"),true,"实时监听已停止（已写入的文件保留在 output/）"); }
+}
+function stopTimerUI(){
+  if(S.rtTimer){clearInterval(S.rtTimer);S.rtTimer=null;}
+  S.rtRunning=false;
+  document.getElementById("rtBtn").style.display="inline-block";
+  document.getElementById("rtStopBtn").style.display="none";
+}
+
+/* —— 启动 —— */
 modeChanged();
+refreshHistory("priv"); refreshHistory("grp");
 </script></body></html>
 """
 # 实现：单页内联 HTML+JS（无外部资源，离线可用）。
