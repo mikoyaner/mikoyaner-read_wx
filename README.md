@@ -206,8 +206,48 @@ copy target\release\wxmsg-exporter.exe ..\bin\
 首次编译约数分钟（OpenSSL 从源码构建）；`Cargo.lock` 已锁定依赖版本，配合
 `.cargo/config.toml` 的镜像配置可直接拉取。
 
-**可选增强**：语音转文字需要 Node + SenseVoice 模型目录（约 250MB，不随仓库分发）——
-设置 `WXMSG_ASR_ROOT` 指向包含 `voice2text.cjs` 的目录即可；不配置则语音显示 `[语音]` 占位符，其余功能不受影响。
+**可选增强**：语音转文字（离线 ASR：Node + silk-wasm + sherpa-onnx SenseVoice，模型约几百 MB）。
+不配置则语音显示 `[语音]` 占位符，其余功能不受影响。安装步骤：
+
+1. 安装 [Node.js LTS](https://nodejs.org/zh-cn)（安装时一路默认即可）
+2. 任意位置建一个 ASR 资源目录（下称 `<asr_root>`），按以下结构摆放：
+
+   ```
+   <asr_root>/
+   ├── voice2text.cjs              ← 从 Export_from_WeChat_v1 项目根拷贝（ASR 入口脚本）
+   ├── package.json                ← 在 vendor 步骤自动生成
+   └── vendor/
+       ├── node_modules/           ← 第 3 步 npm 安装产物
+       └── models/sensevoice/
+           ├── model.int8.onnx     ← 第 4 步下载（文件名必须一致）
+           └── tokens.txt          ← 第 4 步下载
+   ```
+
+3. 安装依赖（版本与已验证环境对齐，sherpa-onnx-win-x64 会自动带上）：
+
+   ```bat
+   cd <asr_root>\vendor
+   npm init -y
+   npm install silk-wasm@3.7.1 sherpa-onnx-node@1.13.3
+   ```
+
+4. 下载 SenseVoice 中英日韩粤 int8 模型（二选一）：
+
+   - GitHub release：<https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17.tar.bz2>
+   - HuggingFace：<https://huggingface.co/csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17>
+
+   解压后取 `model.int8.onnx` 与 `tokens.txt` 两个文件放进 `<asr_root>\vendor\models\sensevoice\`。
+
+5. 在 `.env` 里配置（或首次面板配置后追加）：
+
+   ```
+   WXMSG_ASR_ROOT=<asr_root 的路径>
+   WXMSG_NODE_BIN=node
+   ```
+
+6. 验证：重启面板 → 体检显示 `ASR 可用` → 导出含语音的会话，内容列出现转写文字。
+
+模型来源：[SenseVoice 预训练模型文档](https://github.com/k2-fsa/sherpa/blob/master/docs/source/onnx/sense-voice/pretrained.rst)。
 
 ## 开发与测试
 
