@@ -477,13 +477,12 @@ PAGE = """<!DOCTYPE html>
   <label><input type="radio" name="mode" value="history" checked onchange="modeChanged()">历史导出（一次性任务，导完即止）</label>
   <label><input type="radio" name="mode" value="realtime" onchange="modeChanged()">实时监听（服务端后台每分钟提取，直到按「停止运行」）</label>
  </div>
- <div id="historyOpts">
+ <div id="timeOpts">
   时间范围：<input type="date" id="begin"> ~ <input type="date" id="end">
-  或最近 <input type="number" id="recent" min="1" style="width:80px"> 条（都留空 = 全部历史）
+  或最近 <input type="number" id="recent" min="1" style="width:80px"> 条（都留空 = 全部历史；按原始消息计）
  </div>
  <div id="realtimeOpts" style="display:none">
-  <label><input type="checkbox" id="includeHistory">启动时同时导出历史消息（写进同一个实时文件）</label>
-  （可叠加下方时间范围/最近N）
+  <label><input type="checkbox" id="includeHistory" onchange="modeChanged()">启动时同时导出历史消息（写进同一个实时文件，可叠加上方时间范围/最近N）</label>
   <div class="muted">启动后：黑窗口每分钟提取一次，<b>关闭浏览器页面不影响</b>；重新打开面板能看到运行状态。运行期间请勿用 WPS/Excel 打开正在写入的实时文件（会锁文件导致轮询失败；关闭后下一轮自动补写，数据不丢）。</div>
  </div>
  <div style="margin-top:6px">
@@ -616,7 +615,10 @@ function collectTargets(){
 /* —— ③ 模式与格式 —— */
 function modeChanged(){
   const rt=document.querySelector('input[name=mode][value=realtime]').checked;
-  document.getElementById("historyOpts").style.display=rt?"none":"block";
+  const inc=document.getElementById("includeHistory").checked;
+  // 时间范围/最近N：历史模式始终显示；实时模式勾选「同时导出历史」时显示
+  //（否则这组输入对实时无意义，藏起来避免"提示说可叠加却找不到输入框"）
+  document.getElementById("timeOpts").style.display=(rt && !inc)?"none":"block";
   document.getElementById("realtimeOpts").style.display=rt?"block":"none";
   document.getElementById("exportBtn").style.display=rt?"none":"inline-block";
   document.getElementById("rtBtn").style.display=rt?"inline-block":"none";
