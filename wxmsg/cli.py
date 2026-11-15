@@ -68,12 +68,15 @@ def parse_time_boundary(raw: str, *, end_of_day: bool = False) -> int:
 
 @dataclass
 class _Fetch:
-    """一次 --messages 取数的归一结果：行 + 路由诊断 + 语音 note。"""
+    """一次 --messages 取数的归一结果：行 + 路由诊断 + 语音 note + 原始窗口末端键。"""
     rows: list[dict] = field(default_factory=list)
     route: str = ""
     sid_found: bool = True
     voice_note: str = ""
-    # 实现：内部 dataclass 聚合单次取数产物。
+    raw_last_key: tuple[int, int, int] | None = None   # 筛选前原始行的最大行键（游标锚点用）
+    # 实现：内部 dataclass 聚合单次取数产物；raw_last_key 在成员筛选**之前**计算——
+    #       筛选可能把窗口内行全滤掉（成员最近没发言），此时游标若落回起点，
+    #       下一轮增量会把整个历史全拉回来（真机验收踩到的"recent=10 却导出 1799 条"）。
     # 功能：把 exporter JSON 的关键字段收拢，主流程不必反复 .get。
 
 
@@ -88,6 +91,9 @@ def _fetch_messages(cfg: Config, target: Target, begin: int, end: int,
     route = exp.get("route", "")
     sid_found = bool(exp.get("sid_found", True))
     note = ""
+    # 原始窗口末端键：在成员筛选**之前**取原始行的最大行键——它是"这段历史我们已经读过
+    # 到哪里"的真实锚点（筛选后的空集会让锚点失真，见 _Fetch.raw_last_key 注释）。
+    raw_last_key = session.row_key(max(rows, key=session.row_key)) if rows else None
     # 群聊成员筛选：selected_members=None 表示不筛（全群）；空集筛出 0 条是合法语义。
     # 私聊不过滤（双方都导，用户拍板）。
     if target.chat_type == 0 and target.selected_members is not None:
@@ -109,7 +115,8 @@ def _fetch_messages(cfg: Config, target: Target, begin: int, end: int,
         rendered_rows.append(rendered)
     # 实现：排序后逐行渲染内容列（dict 拷贝避免污染原行——同一条 row 可能被多处引用）。
     # 功能：交付渲染完毕、时间正序的行。
-    return _Fetch(rows=rendered_rows, route=route, sid_found=sid_found, voice_note=note)
+    return _Fetch(rows=rendered_rows, route=route, sid_found=sid_found,
+                  voice_note=note, raw_last_key=raw_last_key)
 
 
 def _sender_display(target: Target, row: dict, sender_map: dict[str, str]) -> str | None:

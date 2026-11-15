@@ -29,11 +29,9 @@ from .config import Config
 
 
 def _row_key(row: dict) -> tuple[int, int, int]:
-    """行的全序键：(create_time, sort_seq, local_id)——与会话内真实顺序一致。"""
-    return (int(row.get("create_time") or 0),
-            int(row.get("sort_seq") or 0),
-            int(row.get("local_id") or 0))
-    # 实现：三元组 key（sort_seq 是同秒内权威顺序，local_id 是最终 tiebreaker）。
+    """行的全序键（委托 session.row_key，口径唯一）。"""
+    return session.row_key(row)
+    # 实现：转发到 session.row_key——cli 的游标锚点与本模块去重共用同一键。
     # 功能：游标比较与排序的唯一键。
 
 
@@ -108,7 +106,11 @@ class RealtimeExport:
                                             rescan=rescan, log=log)
                 records = self._records(t, fetch.rows)
                 self._append(path, records)
-                cursor = max((_row_key(r) for r in fetch.rows), default=(0, 0, 0))
+                # 游标锚在**原始窗口末端**（筛选前），而不是筛选后的行集：
+                # 成员筛选可能把窗口内行全部滤掉（该成员最近没发言），此时锚点若落回
+                # 起点或筛选空集，下一轮增量会把整段历史全拉回来（真机踩到：
+                # recent=10 却导出 1799 条）。原始末端之后的消息才是"新消息"。
+                cursor = fetch.raw_last_key or (0, 0, 0)
                 count = len(records)
             else:
                 cursor = (int(self.started.timestamp()), 0, 0)

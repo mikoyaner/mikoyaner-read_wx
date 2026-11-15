@@ -156,6 +156,17 @@ def ranked_sessions(sessions: list[Session], query: str) -> list[dict]:
     # 功能：面板「按名字匹配」的唯一评分实现。
 
 
+def row_key(row: dict) -> tuple[int, int, int]:
+    """消息行的全序键：(create_time, sort_seq, local_id)——与库内真实顺序一致。
+
+    cli（游标锚点）与 realtime（增量去重）共用，口径唯一。"""
+    return (int(row.get("create_time") or 0),
+            int(row.get("sort_seq") or 0),
+            int(row.get("local_id") or 0))
+    # 实现：三元组键——sort_seq 是同秒内权威顺序，local_id 作最终 tiebreaker。
+    # 功能：游标推进与排序的唯一比较键。
+
+
 def sort_messages(rows: list[dict]) -> list[dict]:
     """消息按时间正序排序：主键 create_time，同秒按 sort_seq，再按 local_id（全稳定）。
 

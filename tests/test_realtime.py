@@ -36,11 +36,14 @@ import json, sys
 args = sys.argv[1:]
 begin = int(args[args.index("--begin") + 1])
 rows = ROWS
+if "--recent" in args:
+    n = int(args[args.index("--recent") + 1])
+    rows = rows[-n:]
 print(json.dumps({"mode": "messages", "sid_found": True, "route": "md5",
                   "messages": [r for r in rows if r["create_time"] >= begin]}))
 """
-# 实现：替身导出器按 --begin 闭区间过滤（模拟 weflow-core 的时间窗行为）。
-# 解析：真实导出器的 begin 语义就是 ct>=begin，替身保持同口径。
+# 实现：替身导出器按 --begin 闭区间过滤 + --recent 尾部截断（模拟 weflow-core 行为）。
+# 解析：真实导出器的 begin 语义就是 ct>=begin，recent 是"最近 N 条原始消息"（筛选前）。
 # 功能：可控增量的数据库替身。
 
 
@@ -140,6 +143,30 @@ class TestRealtimeStart:
         assert all(Path(f["path"]).exists() for f in files)
         # 实现：json → jsonl + 分文件命名（"实时_"前缀）。
         # 功能：分文件组织口径。
+
+    def test_recent_history_no_explosion_with_member_filter(self, tmp_path):
+        """回归：include_history + history_recent + 成员筛选，筛选后 0 条时游标必须锚在
+        原始窗口末端——否则下一轮会把整段历史全部拉回来（真机踩到 recent=10 → 1799 条）。"""
+        cfg = _cfg(tmp_path)
+        rows = [{"local_id": i, "create_time": 100 + i, "sort_seq": i, "local_type": 1,
+                 "content": f"msg{i}", "sender_username": "wxid_a"} for i in range(1, 13)]
+        # 12 条群消息全部来自 wxid_a；目标成员 wxid_me 最近 10 条里一条都没有
+        rt = realtime.RealtimeExport(cfg, [Target(sid="g@chatroom", chat_type=0, display="群",
+                                                  selected_members={"wxid_me"})],
+                                     fmt="csv", merged=True, include_history=True,
+                                     history_recent=10, now=datetime(2026, 1, 1),
+                                     argv_prefix=_make_prefix(tmp_path, rows))
+        assert rt.summary()["total"] == 0                 # 窗口内没有目标成员的消息
+        out = rt.poll_once(argv_prefix=_make_prefix(tmp_path, rows))
+        assert out["new_total"] == 0                      # 不回爆全历史
+        rows_v2 = rows + [{"local_id": 20, "create_time": 115, "sort_seq": 20,
+                           "local_type": 1, "content": "新到的", "sender_username": "wxid_me"}]
+        out = rt.poll_once(argv_prefix=_make_prefix(tmp_path, rows_v2))
+        assert out["new_total"] == 1                      # 新消息照常增量
+        assert "新到的" in rt.path_merged.read_text(encoding="utf-8-sig")
+        # 实现：游标 = 原始窗口末端键（筛选前），poll 的 begin=该键的秒 → 同窗重取，
+        # 行键 > 游标才收录——被筛掉的行永远不会再被拉回。
+        # 功能：成员筛选 + 最近 N 条 的语义正确性。
 
     def test_bad_inputs_rejected(self, tmp_path):
         with pytest.raises(ValueError):
