@@ -155,3 +155,56 @@ class TestRescanRetry:
         assert calls == []
         # 实现：首次成功，rescan 计数为 0。
         # 功能：验证成功路径零额外开销。
+
+    def test_account_switch_auto_rescan(self, tmp_path):
+        # 换号防线：第一次返回旧号数据（serves_current_login=False），重扫后拿到当前号
+        marker = tmp_path / "switch.marker"
+        prefix = _fixture(tmp_path, f'''
+            import sys, json
+            from pathlib import Path
+            ok = Path({str(marker)!r}).exists()
+            if not ok:
+                Path({str(marker)!r}).write_text("x")
+            print(json.dumps({{"ok": True, "serves_current_login": ok,
+                               "current_login_wxid": "wxid_new",
+                               "serving_wxid": ("wxid_old" if not ok else "wxid_new")}}))
+        ''')
+        calls = []
+        out = exporter.list_sessions(_cfg(tmp_path), argv_prefix=prefix,
+                                     rescan=lambda: (calls.append(1), True)[1])
+        assert out["serves_current_login"] is True and out["serving_wxid"] == "wxid_new"
+        assert len(calls) == 1
+        # 实现：serves_current_login=False → 自动重扫一次 → 重试拿到新号数据。
+        # 解析：这是「换号后点一下刷新即可」的核心——用户无感知完成密钥更新。
+        # 功能：换号自愈路径。
+
+    def test_account_switch_persists_raises(self, tmp_path):
+        # 重扫后仍是旧号数据 → 明确报错，绝不拿旧号数据冒充当前号
+        prefix = _fixture(tmp_path, '''
+            import json
+            print(json.dumps({"ok": True, "serves_current_login": False,
+                              "current_login_wxid": "wxid_new", "serving_wxid": "wxid_old"}))
+        ''')
+        calls = []
+        with pytest.raises(exporter.ExporterError, match="检测到换号"):
+            exporter.list_sessions(_cfg(tmp_path), argv_prefix=prefix,
+                                   rescan=lambda: (calls.append(1), True)[1])
+        assert len(calls) == 1
+        # 实现：重扫一次后仍不匹配 → ExporterError（文案带两个 wxid）。
+        # 解析：旧号密钥恰好还能用时会"成功返回错的数据"——比报错更危险，必须拦截。
+        # 功能：换号不可恢复分支。
+
+    def test_mismatch_ignored_when_no_current_login(self, tmp_path):
+        # current_login_wxid 为空 = 数据根下没有任何账号在写库（微信没登录）——
+        # 这不是换号，不触发重扫防线（重扫也扫不出钥，白等几十秒）
+        prefix = _fixture(tmp_path, '''
+            import json
+            print(json.dumps({"ok": True, "serves_current_login": False,
+                              "current_login_wxid": ""}))
+        ''')
+        calls = []
+        out = exporter.list_sessions(_cfg(tmp_path), argv_prefix=prefix,
+                                     rescan=lambda: (calls.append(1), True)[1])
+        assert calls == [] and out["serves_current_login"] is False
+        # 实现：换号防线要求 current_login_wxid 非空才触发。
+        # 功能：区分「换号」与「微信没登录」。

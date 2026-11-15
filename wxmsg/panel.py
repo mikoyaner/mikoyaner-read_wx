@@ -130,6 +130,14 @@ class App:
         #       写入成功后 self.cfg 从 None 变为有效配置，随后的 GET / 就渲染正常面板。
         # 功能：首次运行配置的落盘动作。
 
+    def rescan(self) -> dict:
+        """手动重扫密钥（换号防线的手动兜底按钮）。"""
+        ok, lines = keys.ensure_keys(self.cfg, log=print)
+        return {"ok": ok, "lines": lines}
+        # 实现：直接调 keys.ensure_keys（keyscan 子进程，输出过白名单闸）。
+        # 解析：这是自动重扫之外的手动兜底——换号自动重扫万一失败，用户点一下再试。
+        # 功能：/api/rescan 的实现。
+
     def match(self, query: str) -> dict:
         """按名字模糊匹配会话（v1 ranked_matches 口径），供「按名字选择」。"""
         if self.cfg is None:
@@ -268,6 +276,8 @@ class _Handler(BaseHTTPRequestHandler):
                 return {"ok": True, **app.setup(params)}
             if name == "diagnose":
                 return {"ok": True, **app.diagnose()}
+            if name == "rescan":
+                return {"ok": True, **app.rescan()}
             if name == "sessions":
                 return {"ok": True, **app.sessions()}
             if name == "members":
@@ -311,6 +321,13 @@ class _Handler(BaseHTTPRequestHandler):
         # 功能：页面入口。
 
     def do_POST(self):
+        # 先读完整请求体再校验/响应：如果带着未读的 body 直接回 403 关连接，客户端写 body
+        # 会偶发收到 RST（ConnectionAborted）——表现为测试里 flaky 的失败。先排干再拒。
+        length = int(self.headers.get("Content-Length") or 0)
+        if length > MAX_BODY_BYTES:
+            self._send_json({"ok": False, "error": "请求体过大"}, 413)
+            return
+        body = self.rfile.read(length) if length else b""
         if not _check_host(self.headers.get("Host"), self.server.server_port):
             self._send_json({"ok": False, "error": "host 不允许"}, 403)
             return
@@ -318,17 +335,14 @@ class _Handler(BaseHTTPRequestHandler):
         if not name.startswith("api/"):
             self._send_json({"ok": False, "error": "not found"}, 404)
             return
-        length = int(self.headers.get("Content-Length") or 0)
-        if length > MAX_BODY_BYTES:
-            self._send_json({"ok": False, "error": "请求体过大"}, 413)
-            return
         try:
-            params = json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
+            params = json.loads(body.decode("utf-8")) if body else {}
         except ValueError:
             self._send_json({"ok": False, "error": "请求体不是合法 JSON"}, 400)
             return
         self._send_json(self._api(name[4:], params if isinstance(params, dict) else {}))
-        # 实现：路径 → api/ 前缀校验 → body 大小闸 → JSON 解析 → 分发。
+        # 实现：读 body（有 Content-Length 上限）→ Host 校验 → 路由 → JSON 解析 → 分发。
+        # 解析：Host 校验放在读 body 之后，纯粹为了让拒绝响应前排干输入流，防线本身不变。
         # 功能：POST 统一入口。
 
 
@@ -353,7 +367,8 @@ PAGE = """<!DOCTYPE html>
 
 <section>
  <b>① 体检</b> <button onclick="diagnose()">开始体检</button>
- <div id="statusBox" class="muted">先体检：确认数据根、导出器、密钥状态</div>
+ <button onclick="rescanKeys()">重扫密钥</button>
+ <div id="statusBox" class="muted">先体检：确认数据根、导出器、密钥状态。换号登录后点「重扫密钥」再「刷新会话列表」。</div>
 </section>
 
 <section>
@@ -424,6 +439,13 @@ async function diagnose(){
   const acc = d.accounts.map(a=>`${esc(a.wxid||a.account_dir)}（${a.key_works?"密钥可用":a.has_key?"密钥失效":"无密钥"}，${a.session_db_age_s<0?"?" :Math.round(a.session_db_age_s/60)} 分钟前活跃）`).join("；");
   show(box,true,`数据根 ${d.data_root} ✓ ｜ 导出器 ${d.exporter_exists?"就绪":"缺失(需先编译)"} ｜ ASR ${d.asr_available?"可用":"不可用(语音将显示[语音])"} ｜ 账号：${acc||"无"}`);
   loadSessions();
+}
+async function rescanKeys(){
+  const box = document.getElementById("statusBox");
+  box.textContent = "重扫密钥中（只读扫微信进程内存，约几十秒；微信需保持登录）…";
+  const d = await api("rescan");
+  if(!d.ok){ show(box,false,"重扫失败："+((d.lines||[]).join(" | ")||d.error)); return; }
+  show(box,true,"重扫完成。"+(d.lines||[]).join(" | ")+"——请点「刷新会话列表」加载当前登录号的会话");
 }
 
 function sessRow(s){

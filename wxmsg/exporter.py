@@ -96,10 +96,33 @@ def run_exporter(cfg: Config, mode: str, extra_args: list[str], *,
     # 功能：交付结构化数据。
 
 
+def _login_mismatch(data: dict) -> bool:
+    """换号判定：导出器报告的数据来源号 ≠ 本机当前登录号（当前登录号必须可识别）。"""
+    return data.get("serves_current_login") is False and bool(data.get("current_login_wxid"))
+    # 实现：两个条件缺一不可——serves_current_login=False 且 current_login_wxid 非空。
+    # 解析：current_login_wxid 为空说明数据根下没有任何账号在写库（微信没登录），那不是
+    #       "换号"而是"没登录"，不能按换号防线去重扫（重扫也扫不出钥，白等几十秒）。
+    # 功能：_run_with_rescan 的换号分支触发器。
+
+
+def _mismatch_error(data: dict) -> str:
+    """换号防线的最终报错文案（重扫后仍不匹配）。"""
+    return (f"检测到换号：当前登录账号 {data.get('current_login_wxid') or '?'}，"
+            f"但重扫密钥后仍打不开它的数据（此前显示的是 {data.get('serving_wxid') or '?'} 的）。"
+            "请确认微信已登录当前号——密钥只存在于运行中的微信进程内存里；"
+            "旧号数据不会被当作当前号显示")
+    # 实现：文案带两个账号的 wxid，让用户一眼看清"我登的是 A，程序刚才给的是 B"。
+    # 功能：换号不可恢复时的统一错误出口。
+
+
 def _run_with_rescan(cfg: Config, mode: str, extra_args: list[str], *,
                      argv_prefix: list[str] | None = None,
                      rescan=None, log=None) -> dict:
-    """执行模式调用，失败时自动重扫一次密钥再重试一次（v1 ensure_keys 的失败路径同款）。
+    """执行模式调用，两层自愈防线：
+
+    ① 调用失败（密钥失效/未扫）→ 自动重扫一次密钥 → 重试一次；
+    ② 调用成功但数据来自旧号（换号了，旧钥恰好还能用）→ 重扫 → 重试 →
+       仍拿不到当前登录号的数据就明确报错，**绝不拿旧号数据冒充**。
 
     rescan：测试注入点；默认 keys.ensure_keys(cfg)（重扫密钥）。
     """
@@ -107,18 +130,30 @@ def _run_with_rescan(cfg: Config, mode: str, extra_args: list[str], *,
         lambda: keys.ensure_keys(cfg, log=log)[0]
     )
     try:
-        return run_exporter(cfg, mode, extra_args, argv_prefix=argv_prefix)
+        data = run_exporter(cfg, mode, extra_args, argv_prefix=argv_prefix)
     except ExporterError:
         # 第一次失败：多半是重登录换钥（旧钥打不开库）或还没扫过钥——重扫后再试一次。
         if log:
             log("导出失败，自动重扫密钥后重试一次…")
         if not do_rescan():
             raise ExporterError("重扫密钥后仍失败：微信可能未在本机登录，或微信版本超出适配范围") from None
-        return run_exporter(cfg, mode, extra_args, argv_prefix=argv_prefix)
-    # 实现：失败 → 重扫（rescan 注入）→ 重试一次；重扫失败或重试仍失败都抛 ExporterError。
-    # 解析：只重试一次——无限重试会把"结构性失败"（版本不匹配/数据根错）变成卡死循环；
-    #       「重扫后仍失败」的文案给出两个最常见根因。
-    # 功能：把"换钥导致的一次性失败"对用户透明化。
+        data = run_exporter(cfg, mode, extra_args, argv_prefix=argv_prefix)
+    # 换号防线：旧号密钥恰好还能用时会"成功返回旧号数据"——不报错但数据是错的，
+    # 这比报错更危险，所以必须按 serves_current_login 主动拦截。
+    if _login_mismatch(data):
+        if log:
+            log(f"检测到换号（数据来自 {data.get('serving_wxid')}，当前登录是 "
+                f"{data.get('current_login_wxid')}），自动重扫密钥…")
+        if not do_rescan():
+            raise ExporterError(_mismatch_error(data)) from None
+        data = run_exporter(cfg, mode, extra_args, argv_prefix=argv_prefix)
+        if _login_mismatch(data):
+            raise ExporterError(_mismatch_error(data))
+    return data
+    # 实现：两层防线共用同一个 rescan 注入点；每层最多重试一次，不会无限循环。
+    # 解析：换号重扫通常能成功——微信正登录着新号，内存里就有新钥（keyscan 读运行进程）；
+    #       失败的残余场景 = 微信已退出登录/版本不兼容，此时明确报错而不是给旧号数据。
+    # 功能：把「换号后点一下刷新即可」变成现实（用户拍板的修复方案）。
 
 
 def list_accounts(cfg: Config, **kw) -> dict:

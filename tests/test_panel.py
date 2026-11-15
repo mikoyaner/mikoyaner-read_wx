@@ -157,6 +157,14 @@ class TestHttpApi:
         # 实现：伪造 Host 头 → 403。
         # 功能：DNS rebinding 防线的集成验证。
 
+    def test_rescan_endpoint(self, server, monkeypatch):
+        monkeypatch.setattr(panel.keys, "ensure_keys",
+                            lambda cfg, log=None: (True, ["[store] 已写入 store.json"]))
+        out = _post(server, "/api/rescan")
+        assert out["ok"] is True and out["lines"] == ["[store] 已写入 store.json"]
+        # 实现：/api/rescan 直通 keys.ensure_keys（重扫输出已过白名单闸）。
+        # 功能：换号场景的手动重扫兜底按钮。
+
     def test_match_endpoint(self, server, monkeypatch):
         monkeypatch.setattr(panel.exporter, "list_sessions", lambda cfg, **kw: {"sessions": [
             {"sid": "wxid_zs", "is_group": False, "session_display": "", "remark": "张三",
