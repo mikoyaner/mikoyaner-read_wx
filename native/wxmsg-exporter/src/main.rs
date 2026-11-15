@@ -773,13 +773,19 @@ fn pick_account_opened(
         };
         bail!("没有可用的账号——{hint}");
     }
-    // 选号优先级（v1 同款）：① 传了 wanted_sid 就取第一个 has_sid 为真的账号；
-    // ② 否则按 session.db mtime 取最大（最近被写 = 当前登录号）。
+    // 选号优先级：① 传了 wanted_sid 时，在「库里真有这个会话」的账号中取 session.db
+    // 最近被写的那只（= 当前登录号）。不能取"第一个命中"——账号目录按字典序遍历，
+    // 同一个群/联系人在两个号里都存在时，旧号会稳定压过新号，重扫密钥也救不回来
+    // （重试还是按同样的顺序挑同一个），真机验收踩过这个坑。
     if wanted_sid.is_some() {
-        if let Some((dir, a, _, _)) = openable.iter().find(|x| x.3) {
+        let mut hits: Vec<&(PathBuf, Arc<Account>, std::time::SystemTime, bool)> =
+            openable.iter().filter(|x| x.3).collect();
+        hits.sort_by(|a, b| b.2.cmp(&a.2));
+        if let Some((dir, a, _, _)) = hits.first() {
             return Ok((dir.clone(), a.clone(), true));
         }
     }
+    // ② 没传 sid 或没有账号包含它：按 session.db mtime 取最大（最近被写 = 当前登录号）。
     openable.sort_by(|x, y| y.2.cmp(&x.2));
     let (dir, a, _, has_sid) = openable.into_iter().next().unwrap();
     Ok((dir, a, has_sid))
