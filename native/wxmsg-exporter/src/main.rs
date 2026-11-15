@@ -720,6 +720,189 @@ fn run_group_members_all(ks: &KeyStore, data_root: &str, pretty: bool) -> Result
     // 功能：面板「群聊+成员搜索」索引的数据源。
 }
 
+/// --dump-contact-schema：诊断命令——列出账号布局里每个库的表/列/行数，并对含 username
+/// 列的表抽一行 @chatroom 行，报告各列的类型与非空长度（**绝不打印单元格内容**——
+/// 成员列表里是别人的 ID，诊断只需要结构）。用于定位群成员在本机微信库里的真实存储位置。
+fn run_dump_contact_schema(ks: &KeyStore, data_root: &str, pretty: bool) -> Result<()> {
+    let (acct_dir, account, _) = pick_account_opened(ks, data_root, None, None)?;
+    // 账号布局里全部库都进诊断（群成员可能被 4.x 挪去任何库，不能只看 contact）
+    let mut dbs: Vec<(String, PathBuf)> = vec![("session".into(), account.layout.session_db.clone())];
+    for (i, p) in account.layout.message_dbs.iter().enumerate() {
+        dbs.push((format!("message_{i}"), p.clone()));
+    }
+    for (i, p) in account.layout.media_dbs.iter().enumerate() {
+        dbs.push((format!("media_{i}"), p.clone()));
+    }
+    for (label, p) in [
+        ("contact", &account.layout.contact_db),
+        ("sns", &account.layout.sns_db),
+        ("emoticon", &account.layout.emoticon_db),
+        ("hardlink", &account.layout.hardlink_db),
+        ("message_fts", &account.layout.message_fts_db),
+        ("message_resource", &account.layout.message_resource_db),
+    ] {
+        if let Some(p) = p {
+            dbs.push((label.to_string(), p.clone()));
+        }
+    }
+    // 实现：布局里的库逐一登记；Option 库缺失跳过（None = 本机没有该库，不是错误）。
+    // 功能：诊断的覆盖面 = 全账号。
+    let mut db_out: Vec<Value> = Vec::new();
+    for (label, db) in &dbs {
+        let tables = account.with_conn(db, |c| list_tables(c)).unwrap_or_default();
+        let mut tinfos: Vec<Value> = Vec::new();
+        for t in &tables {
+            let cols = account.with_conn(db, |c| table_columns(c, t)).unwrap_or_default();
+            let rows: Option<i64> = account.with_conn(db, |c| {
+                let safe = sanitize_ident(t)?;
+                c.query_row(&format!("SELECT COUNT(*) FROM \"{safe}\""), [], |r| r.get(0))
+                    .map_err(anyhow::Error::from)
+            })
+            .ok();
+            // 含 username 候选列的表才做 @chatroom 行探测（其它表不可能有成员数据）
+            let user_col = find_candidate(&cols, USER_COLS);
+            let chatroom_row = user_col.and_then(|uc| {
+                let safe_uc = sanitize_ident(&uc).ok()?;
+                let safe_t = sanitize_ident(t).ok()?;
+                let label = label.clone();
+                account
+                    .with_conn(db, move |c| {
+                        let sql = format!(
+                            "SELECT * FROM \"{safe_t}\" WHERE \"{safe_uc}\" LIKE '%@chatroom' LIMIT 1"
+                        );
+                        let mut stmt = c.prepare(&sql)?;
+                        let names: Vec<String> =
+                            stmt.column_names().iter().map(|s| s.to_string()).collect();
+                        let mut rows_q = stmt.query([])?;
+                        let Some(row) = rows_q.next()? else { return Ok(None) };
+                        let mut cells: Vec<Value> = Vec::with_capacity(names.len());
+                        for (idx, name) in names.iter().enumerate() {
+                            let v = row.get_ref(idx)?;
+                            // 只报类型与长度，绝不外泄内容（成员列表=他人 ID）
+                            let cell = match v {
+                                rusqlite::types::ValueRef::Null => json!({"col": name, "null": true}),
+                                rusqlite::types::ValueRef::Integer(i) => json!({"col": name, "int": i}),
+                                rusqlite::types::ValueRef::Real(f) => json!({"col": name, "real": f}),
+                                rusqlite::types::ValueRef::Text(t) => json!({"col": name, "len": t.len()}),
+                                rusqlite::types::ValueRef::Blob(b) => json!({"col": name, "blob_len": b.len()}),
+                            };
+                            cells.push(cell);
+                        }
+                        Ok(Some(cells))
+                    })
+                    .ok()
+                    .flatten()
+                    .map(|cells| {
+                        json!({"table_label": label, "table": t, "user_col": uc, "cells": cells})
+                    })
+            });
+            // 首行值形态（脱敏：只报特征——是否含@chatroom/是否wxid开头/是否整数/长度），
+            // 用于确认 room_id 这类关联键存的是群 id 字符串还是数字外键。
+            let sample_shape: Option<Vec<Value>> = if cols.is_empty() {
+                None
+            } else {
+                let safe_t = match sanitize_ident(t) {
+                    Ok(s) => s,
+                    Err(_) => String::new(),   // 表名不合法（虚表等）→ 跳过采样
+                };
+                if safe_t.is_empty() {
+                    None
+                } else {
+                    account
+                    .with_conn(db, move |c| {
+                        let sql = format!("SELECT * FROM \"{safe_t}\" LIMIT 1");
+                        let mut stmt = c.prepare(&sql)?;
+                        let names: Vec<String> =
+                            stmt.column_names().iter().map(|s| s.to_string()).collect();
+                        let mut rows_q = stmt.query([])?;
+                        let Some(row) = rows_q.next()? else { return Ok(None) };
+                        let mut shape: Vec<Value> = Vec::with_capacity(names.len());
+                        for (idx, name) in names.iter().enumerate() {
+                            let v = row.get_ref(idx)?;
+                            let cell = match v {
+                                rusqlite::types::ValueRef::Null => json!({"col": name, "null": true}),
+                                rusqlite::types::ValueRef::Integer(i) => {
+                                    json!({"col": name, "int": true, "value_hint": i})
+                                }
+                                rusqlite::types::ValueRef::Real(_) => json!({"col": name, "real": true}),
+                                rusqlite::types::ValueRef::Text(t) => {
+                                    let s = String::from_utf8_lossy(t);
+                                    json!({
+                                        "col": name,
+                                        "len": t.len(),
+                                        "has_chatroom": s.contains("@chatroom"),
+                                        "starts_wxid": s.starts_with("wxid_"),
+                                        "starts_gh": s.starts_with("gh_"),
+                                    })
+                                }
+                                rusqlite::types::ValueRef::Blob(b) => {
+                                    json!({"col": name, "blob_len": b.len()})
+                                }
+                            };
+                            shape.push(cell);
+                        }
+                        Ok(Some(shape))
+                    })
+                    .ok()
+                    .flatten()
+                }
+            };
+            let mut ti = json!({ "table": t, "rows": rows, "columns": cols });
+            if let Some(cr) = chatroom_row {
+                ti.as_object_mut().unwrap().insert("chatroom_row".into(), cr);
+            }
+            if let Some(sp) = sample_shape {
+                ti.as_object_mut().unwrap().insert("sample_shape".into(), Value::Array(sp));
+            }
+            tinfos.push(ti);
+        }
+        db_out.push(json!({ "db": label, "tables": tinfos }));
+    }
+    let (serving_wxid, current_login_wxid, serves_current_login) =
+        login_guard_fields(data_root, &acct_dir);
+    // 成员外键关联探针：chatroom_member.member_id 到底指向哪张表（contact.id / name2id.rowid /
+    // 其它）——只报匹配数量，不报内容。定位整数外键模型的真实关联路径。
+    let mut join_probe: Value = json!({ "probed": false });
+    if let Some(contact_db) = &account.layout.contact_db {
+        let q = |sql: &str| -> Option<i64> {
+            account.with_conn(contact_db, |c| {
+                c.query_row(sql, [], |r| r.get::<_, i64>(0)).map_err(anyhow::Error::from)
+            })
+            .ok()
+        };
+        let total = q("SELECT COUNT(*) FROM \"chatroom_member\"");
+        let via_contact = q(
+            "SELECT COUNT(*) FROM \"chatroom_member\" cm \
+             JOIN \"contact\" c ON cm.member_id = c.id");
+        let via_name2id = q(
+            "SELECT COUNT(*) FROM \"chatroom_member\" cm \
+             JOIN \"name2id\" n2 ON n2.rowid = cm.member_id");
+        let rooms_linked = q(
+            "SELECT COUNT(DISTINCT cm.room_id) FROM \"chatroom_member\" cm \
+             JOIN \"chat_room\" cr ON cm.room_id = cr.id");
+        join_probe = json!({
+            "probed": true,
+            "chatroom_member_rows": total,
+            "member_id_via_contact_id": via_contact,
+            "member_id_via_name2id_rowid": via_name2id,
+            "rooms_linked_to_chat_room": rooms_linked,
+        });
+    }
+    emit(&json!({
+        "mode": "dump_contact_schema",
+        "serving_wxid": serving_wxid,
+        "current_login_wxid": current_login_wxid,
+        "serves_current_login": serves_current_login,
+        "member_join_probe": join_probe,
+        "dbs": db_out,
+    }), pretty);
+    Ok(())
+    // 实现：全库遍历 → 逐表（行数/列名）→ 含 username 列的表抽 @chatroom 行报类型与长度。
+    // 解析：COUNT 失败（虚表等）降级为 null；LIKE 命中不了（无群行）则无 chatroom_row 字段；
+    //       值长度是定位成员列的关键信号——成员列表列的长度会明显大于普通列。
+    // 功能：群成员存储位置诊断（修复方案第 1 步的证据来源）。
+}
+
 /// 选当前登录账号并直接交付已打开的 Account：数据根下「session.db 最近被写过且密钥能开库」的那只。
 /// 与 v1 pick_account_dir 的差异：① 本项目数据根必填且强校验，不做"根外兜底"（绝不静默读别的目录）；
 /// ② 直接返回 Arc<Account>，调用方不必重复开库验钥；③ 支持 wanted_sid——优先选「库里真有这个会话」
@@ -1136,6 +1319,7 @@ struct Args {
     list_sessions: bool,
     group_members: bool,
     group_members_all: bool,
+    dump_contact_schema: bool,
     messages: bool,
     pretty: bool,
     version: bool,
@@ -1156,6 +1340,7 @@ fn parse_args(argv: &[String]) -> Args {
         list_sessions: false,
         group_members: false,
         group_members_all: false,
+        dump_contact_schema: false,
         messages: false,
         pretty: false,
         version: false,
@@ -1188,6 +1373,7 @@ fn parse_args(argv: &[String]) -> Args {
             "--list-sessions" => a.list_sessions = true,
             "--group-members" => a.group_members = true,
             "--group-members-all" => a.group_members_all = true,
+            "--dump-contact-schema" => a.dump_contact_schema = true,
             "--messages" => a.messages = true,
             "--pretty" => a.pretty = true,
             "--version" | "-V" => a.version = true,
@@ -1239,7 +1425,7 @@ fn main() {
 
 fn run(args: Args) -> Result<()> {
     if !args.list_accounts && !args.list_sessions && !args.group_members
-        && !args.group_members_all && !args.messages {
+        && !args.group_members_all && !args.dump_contact_schema && !args.messages {
         bail!("必须指定模式：--list-accounts / --list-sessions / --group-members / --group-members-all / --messages（--version 查看用法）");
     }
     let data_root = match &args.data_root {
@@ -1267,6 +1453,9 @@ fn run(args: Args) -> Result<()> {
     }
     if args.group_members_all {
         return run_group_members_all(&ks, &data_root, args.pretty);
+    }
+    if args.dump_contact_schema {
+        return run_dump_contact_schema(&ks, &data_root, args.pretty);
     }
     run_messages(
         &ks, &data_root, args.account.as_deref(),
