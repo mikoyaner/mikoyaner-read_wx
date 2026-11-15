@@ -37,11 +37,13 @@ def patch_exe() -> None:
 def verify() -> None:
     """核对隐私特征清零。"""
     data = EXE.read_bytes()
-    for _, search in PATCHES:
-        assert search not in data, f"残留: {search!r}"
+    for search, _repl in PATCHES:
+        assert search not in data, f"泄漏残留: {search!r}"
     for pat in (b"E:/xwechat_files", b"8vmf", b"yx99"):
         assert pat not in data, f"残留: {pat!r}"
     print("[verify] 隐私特征清零 ✓")
+    # 实现：核对泄漏源（PATCHES 的 search）不再出现；redact1 是覆写占位值，
+    # 无害且必然存在于补丁后的 exe 中，不列入禁项。
     # 功能：补丁后的强制核对。
 
 

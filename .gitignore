@@ -82,3 +82,6 @@ native/.tools/
 
 # ----- 运行缓存（cache/ 里有密钥库 store.json，绝不入库）-----
 cache/
+
+# ----- 发版产物（dist/ 绿色包，不入库）-----
+dist/
