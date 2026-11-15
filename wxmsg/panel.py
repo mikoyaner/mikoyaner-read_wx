@@ -618,7 +618,10 @@ def serve(cfg: Config | None, port: int = 8765, open_browser: bool = True) -> No
     server.app = App(cfg)
     url = f"http://127.0.0.1:{port}/"
     print(f"[panel] 微信聊天记录提取面板已启动：{url}（Ctrl+C 停止）")
-    print(f"[panel] 数据根：{cfg.data_root}")
+    if cfg is None:
+        print("[panel] 首次配置模式：请在打开的页面里填写微信数据根（会自动写入 .env）")
+    else:
+        print(f"[panel] 数据根：{cfg.data_root}")
     if open_browser:
         threading.Timer(0.6, webbrowser.open, [url]).start()
     try:
