@@ -685,9 +685,16 @@ fn run_group_members_all(ks: &KeyStore, data_root: &str, pretty: bool) -> Result
                 )
             }
         };
+        // 群的原始名称字段（备注/昵称/微信号，来自 contact 库名称表）随索引输出——
+        // 会话表的显示列在部分微信库上为空，组合群名只能在 Python 端用这些字段算。
+        let ginfo = names.get(sid);
         groups.push(json!({
             "sid": sid,
             "name": disp,
+            "remark": ginfo.map(|x| x.remark.clone()).unwrap_or_default(),
+            "nickname": ginfo.map(|x| x.nickname.clone()).unwrap_or_default(),
+            "alias": ginfo.map(|x| x.alias.clone()).unwrap_or_default(),
+            "session_display": disp.clone(),
             "count": members.len(),
             "members": members,
             "error": err,
