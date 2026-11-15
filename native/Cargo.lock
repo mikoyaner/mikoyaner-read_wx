@@ -638,6 +638,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "hex",
+ "rusqlite",
  "ruzstd",
  "serde_json",
  "wcdb-native",
