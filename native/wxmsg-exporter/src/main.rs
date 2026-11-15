@@ -548,6 +548,46 @@ fn account_dirs_under(root: &Path) -> Vec<(String, PathBuf)> {
     // 功能：--list-accounts 与账号选择共用的枚举出口（排序保证输出可复现）。
 }
 
+/// 本机当前登录账号：数据根下所有「含 db_storage/session/session.db」的账号目录里，
+/// session.db 最近被写的那只——微信只写当前登录号。纯 stat 判定，**不需要密钥**，
+/// 所以密钥失效/未扫的新号也能被认出来（这正是换号防线的依据）。
+fn current_login(data_root: &str) -> Option<(String, String)> {
+    let mut best: Option<(std::time::SystemTime, String, String)> = None;
+    for (base, dir) in account_dirs_under(Path::new(data_root)) {
+        let session_db = dir.join("db_storage").join("session").join("session.db");
+        let m = account_mtime(&session_db);
+        if best.as_ref().map_or(true, |(t, _, _)| m > *t) {
+            best = Some((m, base.clone(), clean_account_dir_name(&base)));
+        }
+    }
+    best.map(|(_, base, wxid)| (base, wxid))
+    // 实现：遍历账号目录取 session.db mtime 最大者（与 login_probe 同判据，但不要求有钥）。
+    // 解析：返回 (账号目录名, 还原的 wxid)；数据根下没有任何账号目录时 None。
+    // 功能：让每个模式的输出都能带上「数据来源号 vs 当前登录号」的一致性标记，
+    //       Python 侧据此触发换号防线（自动重扫），杜绝拿旧号数据冒充当前号。
+}
+
+/// 换号防线字段：serving（本次打开的账号）是否就是当前登录号。
+/// 三个模式的输出统一带 serving_wxid / current_login_wxid / serves_current_login。
+fn login_guard_fields(data_root: &str, acct_dir: &Path) -> (String, String, bool) {
+    let serving = acct_dir
+        .file_name()
+        .map(|s| clean_account_dir_name(&s.to_string_lossy()))
+        .unwrap_or_default();
+    let (cur_dir, cur_wxid) = current_login(data_root).unwrap_or_default();
+    let serves = !cur_dir.is_empty()
+        && acct_dir
+            .file_name()
+            .map(|s| s.eq_ignore_ascii_case(&cur_dir))
+            .unwrap_or(false);
+    (serving, cur_wxid, serves)
+    // 实现：serving 取本次实际打开的账号目录还原 wxid；cur 取 stat 探测的当前登录号；
+    //       一致性按目录名忽略大小写比较。
+    // 解析：cur_dir 为空（数据根下没有任何账号在写）时 serves=False——Python 侧仅在
+    //       current_login_wxid 非空时才触发重扫防线，避免"微信从未登录"被误判成换号。
+    // 功能：换号防线的判定数据源。
+}
+
 /// 选当前登录账号并直接交付已打开的 Account：数据根下「session.db 最近被写过且密钥能开库」的那只。
 /// 与 v1 pick_account_dir 的差异：① 本项目数据根必填且强校验，不做"根外兜底"（绝不静默读别的目录）；
 /// ② 直接返回 Arc<Account>，调用方不必重复开库验钥；③ 支持 wanted_sid——优先选「库里真有这个会话」
@@ -678,6 +718,8 @@ fn run_group_members(
         Ok(v) => (v, None),
         Err(e) => (Vec::new(), Some(e.to_string())),
     };
+    let (serving_wxid, current_login_wxid, serves_current_login) =
+        login_guard_fields(data_root, &acct_dir);
     let items: Vec<Value> = members
         .into_iter()
         .map(|m| {
@@ -697,6 +739,9 @@ fn run_group_members(
         "is_group": is_group(sid),
         "sid_found": sid_found,
         "account_dir": acct_dir.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default(),
+        "serving_wxid": serving_wxid,
+        "current_login_wxid": current_login_wxid,
+        "serves_current_login": serves_current_login,
         "count": items.len(),
         "members": items,
         "error": members_error,
@@ -857,12 +902,17 @@ fn run_messages(
             "voice": voice,                                      // 仅语音消息且给了 --voice-out 时非 null
         }));
     }
+    let (serving_wxid, current_login_wxid, serves_current_login) =
+        login_guard_fields(data_root, &acct_dir);
     emit(&json!({
         "mode": "messages",
         "sid": sid,
         "is_group": is_group(sid),
         "sid_found": sid_found,
         "account_dir": acct_dir.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default(),
+        "serving_wxid": serving_wxid,
+        "current_login_wxid": current_login_wxid,
+        "serves_current_login": serves_current_login,
         "my_id": my_id,
         "route": route,
         "time_fallback": time_fallback,
@@ -916,10 +966,16 @@ fn run_list_sessions(ks: &KeyStore, data_root: &str, wanted: Option<&str>, prett
         .collect();
     // 输出原始名称字段，展示名回退（备注>昵称>微信号>id）由 Python session.py 统一做——
     // 导出器只交数据，不做展示决策（职责边界见文件头注释）。
+    // 换号防线字段：serves_current_login=False 时 Python 侧触发自动重扫，绝不拿旧号数据。
+    let (serving_wxid, current_login_wxid, serves_current_login) =
+        login_guard_fields(data_root, &acct_dir);
     emit(&json!({
         "mode": "list_sessions",
         "account_dir": acct_dir.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default(),
-        "wxid": acct_dir.file_name().map(|s| clean_account_dir_name(&s.to_string_lossy())).unwrap_or_default(),
+        "wxid": serving_wxid,
+        "serving_wxid": serving_wxid,
+        "current_login_wxid": current_login_wxid,
+        "serves_current_login": serves_current_login,
         "count": sessions.len(),
         "sessions": sessions,
     }), pretty);
@@ -1198,5 +1254,30 @@ mod tests {
         assert_eq!(a.voice_out.as_deref(), Some("D:/tmp/voices"));
         // 实现：--voice-out 带值旗标解析。
         // 功能：语音落盘开关的参数锚点。
+    }
+
+    #[test]
+    fn current_login_picks_newest_session_db() {
+        let root = std::env::temp_dir().join(format!("wxmsg_curlogin_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let old = root.join("wxid_old_1111").join("db_storage").join("session");
+        let new = root.join("wxid_new_2222").join("db_storage").join("session");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::create_dir_all(&new).unwrap();
+        // 顺序创建：后创建的 session.db mtime 更新 = 当前登录号
+        std::fs::write(old.join("session.db"), b"x").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        std::fs::write(new.join("session.db"), b"x").unwrap();
+        let (dir, wxid) = current_login(root.to_str().unwrap()).unwrap();
+        assert_eq!(dir, "wxid_new_2222");
+        assert_eq!(wxid, "wxid_new");
+        // 非账号目录（无 session.db）不参与判定
+        std::fs::create_dir_all(root.join("all_users")).unwrap();
+        let (dir2, _) = current_login(root.to_str().unwrap()).unwrap();
+        assert_eq!(dir2, "wxid_new_2222");
+        let _ = std::fs::remove_dir_all(&root);
+        // 实现：current_login 只看「含 session.db 的目录里 mtime 最新」——不需要密钥。
+        // 解析：这是换号防线的判定源：新号就算没有钥也能被认出来（触发 Python 侧重扫）。
+        // 功能：当前登录号探测的锚点。
     }
 }
