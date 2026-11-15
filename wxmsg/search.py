@@ -14,7 +14,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from .session import Session, _match_degree, ranked_sessions
+from .session import Session, _match_degree, combined_name, ranked_sessions
 
 # 实现：import json/Path + session 的评分器（口径唯一，不另写一套）。
 # 功能：本模块全部依赖。
@@ -26,14 +26,19 @@ HISTORY_MAX = 50
 
 
 def build_member_index(groups_export: dict) -> dict:
-    """--group-members-all JSON → {sid: {"name": 群名, "members": [成员 dict]}}。
+    """--group-members-all JSON → {sid: {name/error/群原始名称字段, "members": [...]}}。
 
     成员 dict 保留 Rust 原始字段（username/group_display/remark/nickname/alias/source）；
-    Rust 端每群的 error 字段（回退原因）透传为索引里该群的 "error"，供前端展示。"""
+    群的 remark/nickname/alias/session_display 原始字段同样入索引——组合群名在 Python 端
+    算（会话表显示列在部分微信库上为空，不能只用 name）。每群 error 字段（回退原因）透传。"""
     index: dict = {}
     for g in groups_export.get("groups", []):
         index[g.get("sid") or ""] = {
             "name": g.get("name") or "",
+            "remark": g.get("remark") or "",
+            "nickname": g.get("nickname") or "",
+            "alias": g.get("alias") or "",
+            "session_display": g.get("session_display") or "",
             "error": g.get("error"),
             "members": g.get("members") or [],
         }
@@ -57,21 +62,67 @@ def search_privates(sessions: list[Session], query: str) -> list[dict]:
 
 
 def search_groups(index: dict, sessions: list[Session], query: str) -> list[dict]:
-    """群搜索：①命中群名 → {kind:"group"}（导该群全部消息）；
-    ②命中群内成员名（备注/昵称/微信号/原始id）→ {kind:"member"}（导该群该成员消息）。
+    """群搜索（排序：群在前、成员在后）：
 
-    排序：群在前、成员在后；各自按得分降序、同分按显示名字典序。"""
+    ① 群名命中 → {kind:"group"}（导该群全部消息）+ **展开该群全部成员条目**
+       （用户拍板：不截断，每条形如「成员名（群名）」，只导该成员）；
+    ② 群内成员名命中（备注/昵称/微信号/原始id）→ {kind:"member"}（跨全部群匹配）。
+
+    成员条目去重：同一 (群,成员) 若既被展开又被名字命中，保留带得分的命中条目。"""
     q = (query or "").strip()
     if not q:
         return []
     group_sessions = [s for s in sessions if s.is_group]
+    session_names = {s.sid: s.display_name() for s in sessions}
+    # 组合群名：会话组合名优先（字段②口径），没有会话的群用索引原始字段算，最后兜底 name。
+    def group_name_of(sid: str) -> str:
+        if sid in session_names:
+            return session_names[sid]
+        entry = index.get(sid) or {}
+        return combined_name(entry.get("remark"), entry.get("nickname"), entry.get("alias"),
+                             fallback=entry.get("name") or sid)
+
+    def member_entry(sid: str, m: dict, matched: tuple | None) -> dict:
+        gname = group_name_of(sid)
+        mdisplay = combined_name(m.get("remark"), m.get("nickname"), m.get("group_display"),
+                                 m.get("alias"), fallback=m.get("username") or "")
+        username = m.get("username") or ""
+        entry = {
+            "kind": "member",
+            "sid": sid,
+            "username": username,
+            "group_name": gname,
+            "member_display": mdisplay,
+            "group_display": m.get("group_display") or "",
+            "display": f"{mdisplay}（{gname}）" if gname else mdisplay,
+            "source": m.get("source") or "",
+            "key": f"{sid}|{username}",
+        }
+        if matched:
+            entry.update({"degree": matched[0], "field": matched[2],
+                          "score": matched[0] * 10 + matched[1]})
+        else:
+            entry.update({"degree": 0, "field": "", "score": 0})
+        return entry
+        # 实现：成员展示名 = 组合格式（备注 昵称 群内昵称 微信号，与字段③一致），
+        #       条目 display 再套「（群名）」——用户拍板的「小舒克（qaq）」形态。
+        # 功能：两类成员条目（展开/命中）的统一构造。
+
     # ① 群名命中（ranked_sessions 已按得分降序）
     group_hits = ranked_sessions(group_sessions, query)
     out: list[dict] = [{"kind": "group", **h} for h in group_hits]
-    # ② 群·成员组合：遍历索引里每个群的成员，按成员字段评分（权重与 ranked_sessions 一致）。
+    # ② 群名命中 → 展开该群全部成员（用户拍板：不截断；条目按索引序=发言者池的活跃序）
+    seen_keys: set[str] = set()
+    for h in group_hits:
+        for m in (index.get(h["sid"]) or {}).get("members") or []:
+            entry = member_entry(h["sid"], m, matched=None)
+            if entry["key"] not in seen_keys:
+                out.append(entry)
+                seen_keys.add(entry["key"])
+    # ③ 成员名字命中（跨全部群）：与展开条目按 key 去重（命中的带得分/字段信息），
+    #    未被展开覆盖的（群名没命中但成员名命中）按得分降序排在后面。
     member_hits: list[dict] = []
     for sid, entry in index.items():
-        gname = entry.get("name") or ""
         for m in entry.get("members") or []:
             best = None  # (degree, rank, tag)
             for value, rank, tag in (
@@ -85,41 +136,17 @@ def search_groups(index: dict, sessions: list[Session], query: str) -> list[dict
                     best = (degree, rank, tag)
             if best is None:
                 continue
-            # 成员展示名走与导出字段③相同的回退链（备注>昵称>微信号>id）。
-            display = _first_not_blank(m.get("remark"), m.get("nickname"), m.get("alias")) \
-                or m.get("username") or ""
-            member_hits.append({
-                "kind": "member",
-                "sid": sid,
-                "username": m.get("username") or "",
-                "group_name": gname,
-                "member_display": display,
-                "group_display": m.get("group_display") or "",
-                "display": f"{gname}·{display}" if gname else display,
-                "source": m.get("source") or "",
-                "degree": best[0],
-                "field": best[2],
-                "score": best[0] * 10 + best[1],
-            })
+            member_hits.append(member_entry(sid, m, matched=best))
     member_hits.sort(key=lambda x: (-x["score"], x["display"]))
-    out.extend(member_hits)
+    for mh in member_hits:
+        if mh["key"] not in seen_keys:
+            out.append(mh)
+            seen_keys.add(mh["key"])
     return out
-    # 实现：群名走 ranked_sessions（会话显示名/备注/昵称都在群会话字段里）；
-    #       成员组合在索引上逐群逐成员评分，排序规则与群命中一致（得分降序+字典序）。
-    # 解析：成员条目带 source（roster/sender_pool）与 group_display，前端标注来源辅助辨认；
-    #       群名命中只给群（不叠加"群·我"之类的组合——导全群已包含所有成员）。
+    # 实现：三段产出——群条目、展开成员（索引序）、名字命中成员（得分序），按 key 去重。
+    # 解析：展开段让「搜群名」直接能挑具体成员（用户拍板）；命中段让「搜成员名」跨群定位；
+    #       群名在前是硬规则，展开成员紧跟其群条目，跨群命中的成员殿后。
     # 功能：面板第二行搜索的数据源。
-
-
-def _first_not_blank(*values: str) -> str:
-    """第一个 strip 后非空的值（与 session.py 的展示回退链同语义）。"""
-    for v in values:
-        if v and v.strip():
-            return v.strip()
-    return ""
-    # 实现：回退链原语（session.py 同名私有函数在此模块的场景复用——
-    # 成员 dict 不是 Session 对象，走不到那个实现）。
-    # 功能：成员条目的展示名计算。
 
 
 class SearchHistory:

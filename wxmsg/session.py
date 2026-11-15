@@ -14,15 +14,19 @@ from dataclasses import dataclass
 # 功能：本模块全部依赖。
 
 
-def _first_not_blank(*values: str) -> str:
-    """返回第一个 strip 后非空的值；全空返回空串。"""
-    for v in values:
-        if v and v.strip():
-            return v.strip()
-    return ""
-    # 实现：逐个判 strip 非空，早返回。
-    # 解析：回退链的实现原语——「非空」一律按 strip 后计，防纯空白备注顶掉有效昵称。
-    # 功能：display_name 的共用底座。
+def combined_name(*parts: str, fallback: str = "") -> str:
+    """组合名：把若干名称用单个空格连接（空组件跳过）；全空回落 fallback。
+
+    字段②/③ 的统一口径（用户拍板）：
+    - 字段②（群聊名/私聊联系人名）= 备注 昵称 微信号，全空 → 内部 id；
+    - 字段③（群内发送者）= 备注 昵称 群内昵称 微信号，全空 → 原始 id。
+    """
+    joined = " ".join(p.strip() for p in parts if p and p.strip())
+    return joined or fallback
+    # 实现：strip 后按序连接，fallback 只在全部为空时出现。
+    # 解析：名字本身含空格时会拼接出连续人名（如「王 二」）——用户要求的空格分隔格式
+    #       明确接受这一点；全空 fallback 保证列里永远有可辨认的标识。
+    # 功能：导出字段②③的取值实现（取代旧的单名回退链）。
 
 
 @dataclass
@@ -38,11 +42,11 @@ class Session:
     sort_ts: int          # 活跃时间戳（秒；0=未知）
 
     def display_name(self) -> str:
-        """字段②的取值：备注 > 昵称 > 微信号 > 内部 id（用户拍板的回退链）。"""
-        return _first_not_blank(self.remark, self.nickname, self.alias) or self.sid
-        # 实现：回退链走 _first_not_blank，全空兜底 sid。
-        # 解析：昵称在 v1 合并口径下对群聊通常就是群名，所以这条链覆盖「群聊名/私聊联系人名」；
-        #       刻意不掺 session_display——用户定义的字段②只有备注/微信号/昵称三个来源。
+        """字段②的取值（组合格式，用户拍板）：备注 昵称 微信号；全空 → 内部 id。"""
+        return combined_name(self.remark, self.nickname, self.alias, fallback=self.sid)
+        # 实现：组合名走 combined_name。
+        # 解析：字段②没有「群内昵称」概念（那是群成员才有的属性）；
+        #       昵称在 v1 合并口径下对群聊通常就是群名，所以群名也在备注/昵称里。
         # 功能：导出文件字段②与面板列表显示名的唯一实现。
     # 实现：dataclass 字段逐一标注来源。
     # 功能：会话的统一载体。
@@ -59,14 +63,11 @@ class Member:
     alias: str           # 微信号
 
     def display_name(self) -> str:
-        """字段③的取值：备注 > 昵称 > 微信号 > 内部 id（与字段②同链，不含群内昵称）。
-
-        用户定义的字段③只有「备注、微信号、昵称」三个来源；群内昵称（group_display）
-        不在规格里，故不参与回退（只随原始数据保留，面板可用于辅助辨认）。"""
-        return _first_not_blank(self.remark, self.nickname, self.alias) or self.username
-        # 实现：与 Session.display_name 同链。
-        # 解析：字段③是导出规格的一部分，必须严格按用户口径实现；group_display 留在数据里
-        #       供面板辅助显示，但绝不进导出列——规格就是规格。
+        """字段③的取值（组合格式，用户拍板）：备注 昵称 群内昵称 微信号；全空 → 原始 id。"""
+        return combined_name(self.remark, self.nickname, self.group_display, self.alias,
+                             fallback=self.username)
+        # 实现：组合名含群内昵称（用户拍板：很多人在群里只有群内昵称，不加会认不出）。
+        # 解析：与字段②的差异就在群内昵称这一段；全空兜底原始 id。
         # 功能：群成员展示名的唯一实现。
     # 实现：dataclass 字段标注来源。
     # 功能：群成员的统一载体。
@@ -90,41 +91,6 @@ def sessions_from_export(export: dict) -> list[Session]:
     # 解析：get(key, "") or "" 双保险——Rust 端不会给 null（都是 String），但手工构造的
     #       fixture/未来版本可能给 null，宽松处理让模型层永不因数据形态崩溃。
     # 功能：面板会话列表的数据装配。
-
-
-def members_from_export(export: dict) -> list[Member]:
-    """把导出器 --group-members 的 JSON 转成 Member 列表。"""
-    out: list[Member] = []
-    for row in export.get("members", []):
-        out.append(Member(
-            username=row.get("username", ""),
-            group_display=row.get("group_display", "") or "",
-            remark=row.get("remark", "") or "",
-            nickname=row.get("nickname", "") or "",
-            alias=row.get("alias", "") or "",
-        ))
-    return out
-    # 实现：逐行取五字段，缺失宽松兜空。
-    # 功能：面板群成员勾选列表的数据装配。
-
-
-def build_sender_map(sessions: list[Session], members: list[Member]) -> dict[str, str]:
-    """构建 username → 展示名 的映射，供消息渲染解析群内发送者（字段③）。
-
-    合并规则：members 与 sessions 都提供，同名键以「先到先得」为准（调用方控制顺序：
-    群成员表更精确，先放 members；sessions 的联系人信息补漏）。展示名走同一回退链。"""
-    out: dict[str, str] = {}
-    for m in members:
-        if m.username and m.username not in out:
-            out[m.username] = m.display_name()
-    for s in sessions:
-        if s.sid and not s.is_group and s.sid not in out:
-            out[s.sid] = s.display_name()
-    return out
-    # 实现：members 全量收录；sessions 只收私聊方（群 id 不是"人"，不该进发送者映射）。
-    # 解析：发送者渲染只需要 username→名字；群聊发送者主要来自群成员表（字段③规格），
-    #       私聊方名字放进来是为面板/日志场景兜底。先到先得保证调用方可用顺序表达优先级。
-    # 功能：render.py 解析群内发送者名的唯一数据源。
 
 
 def _match_degree(query: str, value: str) -> int:

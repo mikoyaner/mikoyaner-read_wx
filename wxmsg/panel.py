@@ -8,7 +8,8 @@
 接口（POST JSON，响应 {"ok": bool, ...} 或 {"ok": false, "error": str}）：
   /api/diagnose        体检（数据根/导出器/ASR/账号与密钥状态）
   /api/sessions        会话列表（私聊/群聊分组，公众号单独一组默认隐藏）
-  /api/members         群成员列表（含展示名，勾选用）
+  /api/search_priv     私聊搜索（备注/昵称/微信号）
+  /api/search_group    群搜索（群名 + 群·成员组合，数据来自成员索引）
   /api/export          历史导出（时间范围/最近N + 格式 + 组织）
   /api/realtime/start  开始实时监听（可选先导历史）
   /api/realtime/poll   实时增量一轮（前端按配置间隔定时调用）
@@ -202,18 +203,6 @@ class App:
         return {"terms": self.search_history.terms(kind)}
         # 功能：搜索历史读取。
 
-    def members(self, sid: str) -> dict:
-        if not sid.strip():
-            raise ValueError("缺少 sid")
-        exp = exporter.group_members(self.cfg, sid.strip())
-        members = session_mod.members_from_export(exp)
-        return {"members": [{
-            "username": m.username,
-            "display": m.display_name(),
-            "group_display": m.group_display,   # 群内昵称原样保留（辅助辨认，不进导出列）
-        } for m in members]}
-        # 功能：群成员勾选列表数据源。
-
     def export(self, params: dict) -> dict:
         with self.lock:
             return cli.run_export(
@@ -343,8 +332,6 @@ class _Handler(BaseHTTPRequestHandler):
                 return {"ok": True, **app.rescan()}
             if name == "sessions":
                 return {"ok": True, **app.sessions()}
-            if name == "members":
-                return {"ok": True, **app.members(str(params.get("sid") or ""))}
             if name == "search_priv":
                 return {"ok": True, **app.search_priv(str(params.get("query") or ""))}
             if name == "search_group":

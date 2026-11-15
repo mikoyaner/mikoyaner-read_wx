@@ -61,17 +61,23 @@ class TestSearchPrivates:
 
 
 class TestSearchGroups:
-    def test_group_hit_before_member_hits(self):
-        # 夹具里没有任何成员字段含"前端交流群" → 只有群名命中，结果恰为 1 条群条目
+    def test_group_hit_expands_all_members(self):
+        # 搜群名：群条目在前，紧跟该群**全部成员**条目（用户拍板：不截断），
+        # 形态 =「成员名（群名）」（用户举例：小舒克（qaq））
         out = search_groups(_INDEX, _SESSIONS, "前端交流群")
-        assert [x["kind"] for x in out] == ["group"]
-        assert out[0]["sid"] == "g1@chatroom" and out[0]["display"] == "前端交流群"
-        # 实现：群名命中排最前（本例中无成员命中）。
-        # 功能：排序口径（用户拍板：按XX群聊在前面）。
+        assert out[0]["kind"] == "group" and out[0]["sid"] == "g1@chatroom"
+        assert out[0]["display"] == "前端交流群"
+        members = [x for x in out if x["kind"] == "member"]
+        assert len(members) == 2                                  # g1 的两个成员全部展开
+        assert members[0]["display"] == "张三 三哥 zs_wx（前端交流群）"
+        assert members[0]["source"] == "sender_pool"
+        assert members[1]["display"] == "小李（前端交流群）"       # 群内昵称进展示名
+        # 实现：展开条目 score=0（未参与匹配），按索引序（发言者池活跃序）排列。
+        # 功能：搜群名直接能挑具体成员。
 
     def test_group_and_member_mixed_order(self):
-        # 一个查询同时命中群与成员：群在前是**硬规则**——即使成员得分更高（此处成员全等 35 分，
-        # 群只是前缀命中 23 分），群条目也排在成员条目之前（用户拍板的展示顺序）
+        # 一个查询同时命中群与成员：群在前是**硬规则**（与各自得分无关——此处成员全等 35 分、
+        # 群只是前缀命中 23 分，群条目仍排最前）
         idx = build_member_index({"groups": [
             {"sid": "g1@chatroom", "name": "张三群", "error": None,
              "members": [{"username": "wxid_zs", "group_display": None, "remark": "张三",
@@ -81,32 +87,41 @@ class TestSearchGroups:
                         remark="", nickname="张三群", alias="", sort_ts=0)]
         out = search_groups(idx, sess, "张三")
         assert [x["kind"] for x in out] == ["group", "member"]   # 群在前、成员在后（硬规则）
-        assert out[0]["score"] < out[1]["score"]                 # 顺序与得分无关
-        # 实现：两类条目分段排序（群段、成员段各自按得分降序），段序固定群在前。
+        assert out[0]["score"] == 23 and out[1]["score"] == 0    # 得分不同不影响顺序；
+        assert out[1]["field"] == ""                             # 成员条目是展开变体（无命中信息）
+        # 实现：群段（命中得分 23）排前，展开成员段（score 0）排后——顺序与得分无关。
+        # 功能：混合命中排序。
+        # 实现：两类条目分段排序（群段、成员段），段序固定群在前。
         # 功能：混合命中排序。
 
-    def test_member_hit(self):
+    def test_member_hit_without_group_hit(self):
+        # 搜成员名（群名不含该词）：没有群条目，直接是命中成员，display 带群名辅助辨认
         out = search_groups(_INDEX, _SESSIONS, "张三")
         assert all(x["kind"] == "member" for x in out)
         assert out[0]["sid"] == "g1@chatroom" and out[0]["username"] == "wxid_zs"
         assert out[0]["field"] == "备注" and out[0]["score"] == 35
-        assert out[0]["display"] == "前端交流群·张三"          # 群·成员 展示形态
+        assert out[0]["member_display"] == "张三 三哥 zs_wx"      # 字段③组合格式
+        assert out[0]["display"] == "张三 三哥 zs_wx（前端交流群）"
         assert out[0]["source"] == "sender_pool"
-        # 实现：成员按 备注>微信号>原始id>昵称 评分；展示名 = 群名·成员回退名。
+        # 实现：成员条目 display = 组合名（群名），组合口径与导出字段③一致。
         # 功能：成员命中条目锚点。
 
     def test_member_fallback_chain(self):
-        # 只有原始 id 可搜（备注/昵称/微信号全空）→ 按「原始id」字段命中，展示名回退到 id
+        # 只有原始 id 可搜（备注/昵称/微信号全空，群内昵称不参与匹配）→ 按「原始id」命中
         out = search_groups(_INDEX, _SESSIONS, "wxid_li")
         assert out[0]["username"] == "wxid_li" and out[0]["field"] == "原始id"
-        assert out[0]["degree"] == 3 and out[0]["member_display"] == "wxid_li"
-        # 实现：搜索字段与导出字段③一致（群内昵称 group_display 不参与匹配）。
+        assert out[0]["degree"] == 3
+        assert out[0]["member_display"] == "小李"                 # 展示名含群内昵称（组合格式）
+        assert out[0]["display"] == "小李（前端交流群）"
+        # 实现：搜索字段 = 备注/微信号/原始id/昵称（群内昵称不参与匹配）；
+        #       展示名 = 组合格式（含群内昵称）——匹配与展示口径分离。
         # 功能：字段口径一致性。
 
     def test_nickname_hit(self):
         out = search_groups(_INDEX, _SESSIONS, "母亲")
         assert out[0]["username"] == "wxid_ma" and out[0]["field"] == "昵称"
         assert out[0]["group_name"] == "家人群"
+        assert out[0]["member_display"] == "母亲 老妈"            # 昵称 + 群内昵称
         # 功能：roster 来源成员的昵称命中。
 
     def test_empty_query(self):

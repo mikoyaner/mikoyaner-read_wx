@@ -29,7 +29,6 @@ _STDERR_TAIL_LINES = 6
 _MODE_FLAG = {
     "list_accounts": "--list-accounts",
     "list_sessions": "--list-sessions",
-    "group_members": "--group-members",
     "group_members_all": "--group-members-all",
     "messages": "--messages",
 }
@@ -173,22 +172,13 @@ def list_sessions(cfg: Config, account: str | None = None, **kw) -> dict:
     # 功能：面板会话列表数据源。
 
 
-def group_members(cfg: Config, sid: str, account: str | None = None, **kw) -> dict:
-    """--group-members：某群完整成员名单。"""
-    extra = ["--sid", sid]
-    if account:
-        extra += ["--account", account]
-    return _run_with_rescan(cfg, "group_members", extra, **kw)
-    # 功能：面板群成员勾选列表数据源。
-
-
 def group_members_all(cfg: Config, **kw) -> dict:
     """--group-members-all：全部群的成员索引（roster 为空自动回退发言者池）。
 
     响应里带统计（groups_total/roster_ok/pool_used）与每群 members（含 source 标注），
-    面板据此懒构建群·成员搜索索引。"""
+    面板据此懒构建群·成员搜索索引；cli/realtime 用它构建发送者取名表。"""
     return _run_with_rescan(cfg, "group_members_all", [], **kw)
-    # 功能：群成员搜索索引的数据源。
+    # 功能：群成员搜索索引与发送者命名的统一数据源。
 
 
 def messages(cfg: Config, sid: str, *, begin: int = 0, end: int = 0,

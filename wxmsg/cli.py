@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
-from . import exporter, outfile, render, session, voice
+from . import exporter, outfile, render, search as search_mod, session, voice
 from .config import Config, ConfigError, load_config
 
 # 实现：import 同包四模块与 Config。
@@ -144,18 +144,29 @@ def run_export(cfg: Config, targets: list[Target], fmt: str = "csv", *,
     now = now or datetime.now()
     per_session: list[dict] = []
     warnings: list[str] = []
+    # 群成员索引（一次导出器进程覆盖全部群）：发送者取名（字段③组合格式）的数据源。
+    # 成员表在本机微信 4.1.15 上失效（诊断结论），索引的发言者池回退是实际数据来源。
+    member_index: dict | None = None
+    if any(t.chat_type == 0 for t in targets):
+        try:
+            member_index = search_mod.build_member_index(
+                exporter.group_members_all(cfg, argv_prefix=argv_prefix,
+                                           rescan=rescan, log=log))
+        except exporter.ExporterError as e:
+            warnings.append(f"群成员索引构建失败，群聊发送者将显示为原始微信号（{e}）")
     for t in targets:
-        # 群聊需要成员表来解析发送者展示名（字段③回退链的数据源）。
+        # 发送者取名表：username → 组合名（备注 昵称 群内昵称 微信号；全空 → 原始 id）。
         sender_map: dict[str, str] = {}
         if t.chat_type == 0:
-            try:
-                members = session.members_from_export(
-                    exporter.group_members(cfg, t.sid, argv_prefix=argv_prefix,
-                                           rescan=rescan, log=log))
-                sender_map = session.build_sender_map([], members)
-            except exporter.ExporterError as e:
-                # 成员表失败不中断导出：发送者退化成原始 wxid，并给一条 warning。
-                warnings.append(f"{t.display}：群成员解析失败，发送者将显示为 wxid（{e}）")
+            entry = (member_index or {}).get(t.sid)
+            if not entry:
+                warnings.append(f"{t.display}：成员索引里没有这个群（安静群或刚换号），发送者将显示为原始微信号")
+            for m in (entry or {}).get("members") or []:
+                u = m.get("username") or ""
+                if u:
+                    sender_map[u] = session.combined_name(
+                        m.get("remark"), m.get("nickname"), m.get("group_display"),
+                        m.get("alias"), fallback=u)
         fetch = _fetch_messages(cfg, t, begin, end, recent, voice_dir,
                                 argv_prefix=argv_prefix, rescan=rescan, log=log)
         if not fetch.sid_found:

@@ -2,49 +2,49 @@
 # 实现：模块 docstring 声明测试范围（全部纯函数）。
 # 功能：锁定用户拍板的名称回退口径与排序口径。
 from wxmsg.session import (
-    Member, Session, build_sender_map, members_from_export, ranked_sessions,
-    sessions_from_export, sort_messages,
+    Member, Session, combined_name, ranked_sessions, sessions_from_export, sort_messages,
 )
 # 实现：import 被测函数与数据类。
 # 功能：取得被测对象。
 
 
 class TestSessionDisplayName:
-    def test_chain(self):
+    def test_combined_format(self):
         s = Session(sid="wxid_x", is_group=False, session_display="会话名",
                     remark="张三", nickname="三哥", alias="zhangsan_wx", sort_ts=0)
-        assert s.display_name() == "张三"          # 备注优先
-        s.remark = "  "                            # 纯空白备注不算有效值
-        assert s.display_name() == "三哥"          # 退到昵称
+        assert s.display_name() == "张三 三哥 zhangsan_wx"
+        s.remark = "  "                            # 纯空白备注跳过
+        assert s.display_name() == "三哥 zhangsan_wx"
         s.nickname = ""
-        assert s.display_name() == "zhangsan_wx"   # 退到微信号
+        assert s.display_name() == "zhangsan_wx"   # 只剩微信号
         s.alias = ""
         assert s.display_name() == "wxid_x"        # 全空兜底内部 id
-        # 实现：回退链 = 备注 > 昵称 > 微信号 > 内部 id（用户拍板，非 v1 best() 顺序）。
-        # 解析：纯空白按空处理（_first_not_blank 里 strip 判定）；
-        #       session_display 刻意不在链里——字段②规格只有备注/微信号/昵称三个来源。
+        # 实现：字段② = 组合格式「备注 昵称 微信号」，空组件跳过，全空兜底内部 id。
+        # 解析：组合格式取代旧的单名回退链（用户拍板：三个名字都在才好认人）。
         # 功能：导出字段②的口径锚点。
 
     def test_group_display_falls_to_nickname(self):
         g = Session(sid="123@chatroom", is_group=True, session_display="前端交流群",
                     remark="", nickname="前端交流群", alias="", sort_ts=9)
         assert g.display_name() == "前端交流群"
-        # 实现：群聊场景——v1 合并口径下 nickname 通常承载群名。
+        # 实现：群聊场景——nickname 通常承载群名。
         # 功能：验证「群聊名」字段在有群名时的取值。
 
 
 class TestMemberDisplayName:
-    def test_chain_excludes_group_display(self):
+    def test_combined_includes_group_display(self):
         m = Member(username="wxid_m", group_display="群里叫小明",
                    remark="", nickname="小明本名", alias="")
-        assert m.display_name() == "小明本名"
+        assert m.display_name() == "小明本名 群里叫小明"   # 昵称 + 群内昵称
         m.nickname = ""
-        assert m.display_name() == "wxid_m"        # 群内昵称不参与回退，直接跳到 id
+        assert m.display_name() == "群里叫小明"            # 只有群内昵称的人也能认出
+        m.group_display = ""
+        assert m.display_name() == "wxid_m"                # 全空兜底原始 id
         m.alias = "ming_wx"
-        assert m.display_name() == "ming_wx"       # 微信号在群内昵称之前
-        # 实现：字段③链 = 备注 > 昵称 > 微信号 > 内部 id；group_display 只留在数据层。
-        # 解析：用户定义的字段③只有「备注、微信号、昵称」三个来源——群内昵称不进导出列，
-        #       这是规格就规格的口径；面板如需辅助辨认可用原始 group_display。
+        m.group_display = "群昵"
+        assert m.display_name() == "群昵 ming_wx"          # 空的备注/昵称跳过
+        # 实现：字段③ = 组合格式「备注 昵称 群内昵称 微信号」，空组件跳过，全空兜底 id。
+        # 解析：群内昵称是用户拍板加进来的——很多人在群里只有群内昵称，不加会认不出。
         # 功能：导出字段③的口径锚点。
 
 
@@ -64,34 +64,15 @@ class TestFromExport:
         # 解析：模型层永不因数据形态崩溃（fixture/未来版本可能给 null）。
         # 功能：JSON → Session 装配的健壮性锚点。
 
-    def test_members_tolerates_missing(self):
-        out = members_from_export({"members": [{"username": "wxid_m"}]})
-        assert out[0].group_display == "" and out[0].alias == ""
-        # 功能：成员装配健壮性。
-
-
-class TestBuildSenderMap:
-    def test_members_first_and_private_only(self):
-        sessions = [
-            Session(sid="g@chatroom", is_group=True, session_display="群", remark="", nickname="群", alias="", sort_ts=0),
-            Session(sid="wxid_f", is_group=False, session_display="", remark="老王", nickname="", alias="", sort_ts=0),
-        ]
-        members = [Member(username="wxid_m", group_display="小明", remark="", nickname="小明", alias="")]
-        m = build_sender_map(sessions, members)
-        assert m["wxid_m"] == "小明"               # 成员进表
-        assert m["wxid_f"] == "老王"               # 私聊方进表
-        assert "g@chatroom" not in m               # 群 id 不是"人"，不进发送者映射
-        # 实现：members 全量收录，sessions 只收私聊方；先 members 后 sessions（先到先得）。
-        # 功能：发送者渲染的数据源口径。
-
-    def test_no_overwrite(self):
-        members = [Member(username="wxid_x", group_display="", remark="成员表版本", nickname="", alias="")]
-        sessions = [Session(sid="wxid_x", is_group=False, session_display="", remark="会话表版本", nickname="", alias="", sort_ts=0)]
-        m = build_sender_map(sessions, members)
-        assert m["wxid_x"] == "成员表版本"
-        # 实现：同名键先到先得（members 在前）。
-        # 解析：群成员表的名称通常比会话表更准（会话表只有显示名）。
-        # 功能：验证先到先得语义。
+class TestCombinedName:
+    def test_skip_blank_and_fallback(self):
+        assert combined_name("张三", "", "  ", "zs") == "张三 zs"
+        assert combined_name("", "", "", fallback="wxid_x") == "wxid_x"
+        assert combined_name() == ""
+        assert combined_name("王 二", "昵称") == "王 二 昵称"   # 名字本身含空格：拼接即可
+        # 实现：空格连接、空组件跳过、全空回落 fallback。
+        # 解析：这是字段②③的统一取值口径（用户拍板的组合格式）。
+        # 功能：组合名工具锚点。
 
 
 class TestRankedSessions:

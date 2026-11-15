@@ -145,8 +145,8 @@ class TestHttpApi:
         # 功能：导出接口协议。
 
     def test_error_protocol(self, server):
-        out = _post(server, "/api/members", {"sid": ""})
-        assert out["ok"] is False and "sid" in out["error"]
+        out = _post(server, "/api/export", {"targets": []})
+        assert out["ok"] is False and "没有选择任何会话" in out["error"]
         out = _post(server, "/api/no_such_api")
         assert out["ok"] is False
         # 实现：参数错误/未知接口都走 {"ok": false, "error"}。

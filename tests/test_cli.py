@@ -27,9 +27,9 @@ _MESSAGES = [
      "content": "被筛掉的", "sender_username": "wxid_c"},                # 不在勾选成员里
 ]
 _MEMBERS = [
-    {"username": "wxid_a", "group_display": "", "remark": "张三", "nickname": "三哥", "alias": "zs"},
-    {"username": "wxid_b", "group_display": "小明", "remark": "", "nickname": "", "alias": ""},
-    {"username": "wxid_me", "group_display": "", "remark": "", "nickname": "我自己的号", "alias": ""},
+    {"username": "wxid_a", "group_display": "", "remark": "张三", "nickname": "三哥", "alias": "zs_wx", "source": "sender_pool"},
+    {"username": "wxid_b", "group_display": "小明", "remark": "", "nickname": "", "alias": "", "source": "sender_pool"},
+    {"username": "wxid_me", "group_display": "", "remark": "", "nickname": "我自己的号", "alias": "", "source": "sender_pool"},
 ]
 # 实现：消息/成员夹具——覆盖同秒乱序（sort_seq 决定先后）、非文本占位、成员筛选、发送者映射。
 # 功能：替身导出器的响应数据。
@@ -46,8 +46,11 @@ if "--messages" in args:
         "route": "md5", "count": len(rows),
         "messages": rows,
     }))
-elif "--group-members" in args:
-    print(json.dumps({"mode": "group_members", "count": 3, "members": MEMBERS}))
+elif "--group-members-all" in args:
+    print(json.dumps({"mode": "group_members_all", "groups_total": 1, "roster_ok": 0,
+                      "pool_used": 1, "groups": [
+        {"sid": "g@chatroom", "name": "", "count": 3,
+         "error": "member_table_empty_fallback_sender_pool", "members": MEMBERS}]}))
 """
 # 实现：替身导出器模板（纯字符串，无 f-string 转义）——messages/group_members 两种模式按旗标响应。
 # 功能：多模式替身。
@@ -104,13 +107,13 @@ class TestRunExport:
         data = rows[1:]
         # 排序：1700000090（更早）在最前；同秒 100 的两条按 sort_seq 先后
         assert [r[3] for r in data] == ["1700000090", "1700000100", "1700000100"]
-        # 字段③：wxid_a→张三（备注优先），wxid_me→我自己的号（昵称），wxid_b→原始 wxid
+        # 字段③组合格式：备注 昵称 群内昵称 微信号（空组件跳过，全空→原始 id）
         senders = {r[5]: r[2] for r in data}
-        assert senders["更早的文本"] == "我自己的号"
-        assert senders["群里的文本"] == "张三"
-        assert senders["[图片]"] == "wxid_b"              # b 无备注/昵称/微信号 → 原始 wxid
-        # 实现：合并 CSV + 成员筛选 + 排序 + 字段③回退链的端到端。
-        # 解析：wxid_b 的 group_display="小明" 不参与回退（用户规格），落到原始 wxid。
+        assert senders["更早的文本"] == "我自己的号"              # 只有昵称
+        assert senders["群里的文本"] == "张三 三哥 zs_wx"          # 备注+昵称+微信号
+        assert senders["[图片]"] == "小明"                        # 只有群内昵称的人也能认出
+        # 实现：合并 CSV + 成员筛选 + 排序 + 字段③组合格式（数据来自成员索引）的端到端。
+        # 解析：wxid_b 只有群内昵称"小明"——组合格式把它带进来了（旧回退链下是裸 wxid）。
         # 功能：主流程口径锚点。
 
     def test_private_split_json(self, tmp_path):
@@ -129,11 +132,11 @@ class TestRunExport:
         # 功能：私聊口径与分文件组织。
 
     def test_warnings_on_member_failure(self, tmp_path):
-        # 替身在 --group-members 时退出 1（模拟成员表解析失败），--messages 正常
+        # 替身在 --group-members-all 时退出 1（模拟成员索引构建失败），--messages 正常
         script = tmp_path / "no_members.py"
         script.write_text(
             "import json, sys\n"
-            "if '--group-members' in sys.argv[1:]:\n"
+            "if '--group-members-all' in sys.argv[1:]:\n"
             "    sys.exit(1)\n"
             "print(json.dumps({'mode': 'messages', 'sid_found': True,"
             " 'messages': " + json.dumps(_MESSAGES, ensure_ascii=False) + "}))",
@@ -143,8 +146,8 @@ class TestRunExport:
                              fmt="csv", now=datetime(2026, 1, 1),
                              argv_prefix=[sys.executable, str(script)])
         assert out["total"] == 4                          # 导出不中断
-        assert any("群成员解析失败" in w for w in out["warnings"])
-        # 实现：成员表失败 → 发送者退化原始 wxid + warning，不中断导出。
+        assert any("群成员索引构建失败" in w for w in out["warnings"])
+        # 实现：索引构建失败 → 发送者退化原始 wxid + warning，不中断导出。
         # 功能：部分失败不连坐的口径。
 
     def test_voice_asr_end_to_end(self, tmp_path, monkeypatch):
@@ -154,10 +157,13 @@ class TestRunExport:
         script.write_text(textwrap.dedent(f'''
             import json, sys, pathlib
             args = sys.argv[1:]
-            if "--group-members" in args:
-                print(json.dumps({{"mode": "group_members", "count": 1, "members":
-                    [{{"username": "wxid_a", "group_display": "", "remark": "张三",
-                       "nickname": "", "alias": ""}}]}}))
+            if "--group-members-all" in args:
+                print(json.dumps({{"mode": "group_members_all", "groups_total": 1,
+                    "roster_ok": 0, "pool_used": 1, "groups": [
+                    {{"sid": "g@chatroom", "name": "", "count": 1, "error": None,
+                      "members": [{{"username": "wxid_a", "group_display": "",
+                                   "remark": "张三", "nickname": "", "alias": "",
+                                   "source": "sender_pool"}}]}}]}}))
             elif "--voice-out" in args:
                 vdir = pathlib.Path(args[args.index("--voice-out") + 1])
                 vdir.mkdir(parents=True, exist_ok=True)

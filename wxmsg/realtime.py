@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from . import cli, exporter, outfile, session, voice
+from . import cli, exporter, outfile, search as search_mod, session, voice
 from .config import Config
 
 # 实现：import 同包 cli（复用 _fetch_messages 的取数+筛选+ASR+渲染流水线）等。
@@ -79,6 +79,18 @@ class RealtimeExport:
         self.started = now or datetime.now()
         self._argv_prefix = argv_prefix     # 测试注入点（_records 拉成员表时复用同一替身）
         self._rescan = rescan
+        self.warnings: list[str] = []
+        # 群成员索引：有群目标时构建一次（发送者取名数据源，与 cli.run_export 同口径）；
+        # 失败降级为空索引（发送者退化原始 id），warning 留给面板展示。
+        self._member_index: dict | None = None
+        if any(t.chat_type == 0 for t in targets):
+            try:
+                self._member_index = search_mod.build_member_index(
+                    exporter.group_members_all(cfg, argv_prefix=argv_prefix,
+                                               rescan=rescan, log=log))
+            except exporter.ExporterError as e:
+                self.warnings.append(
+                    f"群成员索引构建失败，群聊发送者将显示为原始微信号（{e}）")
         out_dir = Path(cfg.output_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
         self.voice_dir = (out_dir / "voices") if cfg.voice2text_js else None
@@ -109,17 +121,18 @@ class RealtimeExport:
         self.last_poll = self.started.strftime("%Y-%m-%d %H:%M:%S")
 
     def _records(self, target: cli.Target, rendered_rows: list[dict]) -> list[dict]:
-        """渲染行 → 6 字段记录（字段③口径与历史导出一致：私聊 null，群聊走映射）。"""
+        """渲染行 → 6 字段记录（字段③口径与历史导出一致：私聊 null，群聊走组合名映射）。"""
         sender_map: dict[str, str] = {}
         if target.chat_type == 0:
-            try:
-                members = session.members_from_export(
-                    exporter.group_members(self.cfg, target.sid,
-                                           argv_prefix=self._argv_prefix,
-                                           rescan=self._rescan))
-                sender_map = session.build_sender_map([], members)
-            except exporter.ExporterError:
-                sender_map = {}   # 成员表失败：发送者退化原始 wxid（与历史导出同口径，但实时轮询里不再刷 warning）
+            # 用启动时构建的成员索引取名（组合格式：备注 昵称 群内昵称 微信号）；
+            # 索引缺失/群不在索引里 → 发送者退化原始 wxid（与历史导出同口径）。
+            entry = (self._member_index or {}).get(target.sid) or {}
+            for m in entry.get("members") or []:
+                u = m.get("username") or ""
+                if u:
+                    sender_map[u] = session.combined_name(
+                        m.get("remark"), m.get("nickname"), m.get("group_display"),
+                        m.get("alias"), fallback=u)
         return [outfile.make_record(target.chat_type, target.display,
                                     cli._sender_display(target, r, sender_map), r)
                 for r in rendered_rows]
