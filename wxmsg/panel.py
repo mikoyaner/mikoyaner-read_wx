@@ -406,8 +406,13 @@ PAGE = """<!DOCTYPE html>
 const S = {sessions: [], meta: {}, members: {}, timer: null, running: false};
 function esc(s){return String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));}
 async function api(name, params={}){
-  const r = await fetch("/api/"+name,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(params)});
-  return await r.json();
+  try{
+    const r = await fetch("/api/"+name,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(params)});
+    return await r.json();
+  }catch(e){
+    // 网络层失败（服务关掉/控制台被关）就地报错——绝不让页面停在"等待中"
+    return {ok:false,error:"无法连接面板服务：请确认黑色控制台窗口还开着（关了就重新双击 start_panel.bat）"};
+  }
 }
 function show(el, ok, text){ el.className = ok?"ok":"err"; el.textContent = text; }
 
@@ -591,8 +596,13 @@ SETUP_PAGE = """<!DOCTYPE html>
 function esc(s){return String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));}
 function show(el,ok,text){ el.className=ok?"ok":"err"; el.textContent=text; }
 async function api(name,params={}){
-  const r=await fetch("/api/"+name,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(params)});
-  return await r.json();
+  try{
+    const r=await fetch("/api/"+name,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(params)});
+    return await r.json();
+  }catch(e){
+    // 网络层失败（服务已被关掉/控制台窗口被关）必须就地报错——否则页面永远停在"保存中…"
+    return {ok:false,error:"无法连接面板服务：请确认黑色控制台窗口还开着（关了就重新双击 start_panel.bat）"};
+  }
 }
 async function save(){
   const el=document.getElementById("msg");
