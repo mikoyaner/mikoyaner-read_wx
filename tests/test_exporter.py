@@ -84,6 +84,21 @@ class TestRunExporter:
         # 实现：替身睡 3 秒，超时 1 秒。
         # 功能：验证超时分支（测试约 1 秒）。
 
+    def test_weflow_key_store_env_passed(self, tmp_path, monkeypatch):
+        # 替身打印收到的 WEFLOW_KEY_STORE，断言子进程环境里被指向项目 cache/
+        prefix = _fixture(tmp_path, '''
+            import json, os
+            print(json.dumps({"store_env": os.environ.get("WEFLOW_KEY_STORE", "")}))
+        ''')
+        monkeypatch.delenv("WEFLOW_KEY_STORE", raising=False)
+        cfg = _cfg(tmp_path)
+        out = exporter.run_exporter(cfg, "list_accounts", [], argv_prefix=prefix)
+        assert out["store_env"] == str(exporter.keys.store_path())
+        assert "cache" in out["store_env"]
+        # 实现：run_exporter 给子进程注入 WEFLOW_KEY_STORE（Rust keystore 的最高优先级来源）。
+        # 解析：这是「密钥库统一落项目 cache/」的落地机制——keyscan 写它、导出器读它，同一份。
+        # 功能：密钥库位置的三方对齐。
+
 
 class TestRescanRetry:
     def test_retry_after_rescan(self, tmp_path):

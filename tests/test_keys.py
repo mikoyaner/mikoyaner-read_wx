@@ -4,7 +4,7 @@
 import textwrap
 
 from wxmsg import keys
-from wxmsg.config import KEY_DATA_ROOT, load_config
+from wxmsg.config import KEY_DATA_ROOT, load_config, project_root
 
 # 实现：import 被测模块与配置构造器。
 # 功能：取得被测函数与 cfg 夹具构造。
@@ -103,12 +103,40 @@ class TestEnsureKeys:
         # 解析：超时折成 (False, 一行可读诊断) 而不是抛异常——面板按钮场景不该炸栈。
         # 功能：验证超时分支（测试耗时约 1 秒）。
 
-    def test_store_path_env_override(self, tmp_path, monkeypatch):
+    def test_store_path_default_is_project_cache(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("WEFLOW_KEY_STORE", raising=False)
+        assert keys.store_path() == project_root() / "cache" / "keystore" / "store.json"
         monkeypatch.setenv("WEFLOW_KEY_STORE", str(tmp_path / "custom.json"))
         assert keys.store_path() == tmp_path / "custom.json"
-        monkeypatch.delenv("WEFLOW_KEY_STORE", raising=False)
-        assert keys.store_path().name == "store.json"
-        assert keys.store_path().parent.name == "weflow-key-provider"
-        # 实现：store_path 的两级解析（环境变量优先 → APPDATA 默认）。
-        # 解析：与 Rust keystore::store_path 同口径——「写的文件 = 读的文件」。
-        # 功能：验证 store 定位口径。
+        # 实现：默认 = 项目 cache/keystore/store.json（用户拍板：缓存不写 C 盘）；
+        #       WEFLOW_KEY_STORE 环境变量仍是最优先（Python/Rust/子进程三方的对齐开关）。
+        # 解析：v1 的 %APPDATA% 位置不再是默认——只在迁移时作为来源读取。
+        # 功能：store 定位口径（迁移到项目内）。
+
+    def test_migrate_legacy_store(self, tmp_path, monkeypatch):
+        # 用 WEFLOW_KEY_STORE 把迁移目标指进 tmp——migrate 走 store_path()，天然支持注入，
+        # 测试绝不触碰真实项目 cache/（那里是运行时密钥的领地）。
+        target = tmp_path / "cache" / "keystore" / "store.json"
+        monkeypatch.setenv("WEFLOW_KEY_STORE", str(target))
+        fake_appdata = tmp_path / "appdata"
+        legacy = fake_appdata / "weflow-key-provider" / "store.json"
+        legacy.parent.mkdir(parents=True)
+        legacy.write_text('{"db_keys":{}}', encoding="utf-8")
+        monkeypatch.setenv("APPDATA", str(fake_appdata))
+        note = keys.migrate_legacy_store()
+        assert "迁移" in note
+        assert target.exists()
+        assert target.read_text(encoding="utf-8") == '{"db_keys":{}}'
+        assert legacy.exists()                          # 原文件保留（v1 不受影响）
+        assert keys.migrate_legacy_store() == ""        # 目标已有 → 不再动作
+        # 实现：复制不移动 + 目标已有跳过。
+        # 解析：migrate 的目标是 store_path()——与运行时读写同一份，测试通过环境变量重定向到 tmp。
+        # 功能：C 盘 → 项目内 的密钥库迁移口径。
+
+    def test_migrate_noop_when_absent(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("WEFLOW_KEY_STORE", str(tmp_path / "cache" / "store.json"))
+        monkeypatch.setenv("APPDATA", str(tmp_path / "empty_appdata"))  # 没有 legacy
+        assert keys.migrate_legacy_store() == ""
+        assert not (tmp_path / "cache" / "store.json").exists()
+        # 实现：两边都没有 → 无动作（不建空目录）。
+        # 功能：全新机器零噪音。

@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 
 from . import keys
@@ -57,10 +58,15 @@ def run_exporter(cfg: Config, mode: str, extra_args: list[str], *,
     # 解析：data_root 与附加参数全部 str() 化（Path/数字都能安全拼）；顺序固定便于 fixture 断言。
     # 功能：统一的子进程命令构造。
     timeout_s = timeout if timeout is not None else cfg.exporter_timeout_s
+    # WEFLOW_KEY_STORE 指向项目 cache/ 的密钥库（用户拍板：缓存不写 C 盘）——
+    # Rust keystore::store_path() 的最高优先级就是该环境变量，子进程环境对齐后
+    # 「keyscan 写的 = 导出器读的」始终是项目内同一份文件。
+    env = dict(os.environ)
+    env["WEFLOW_KEY_STORE"] = str(keys.store_path())
     try:
         proc = subprocess.run(
             argv, capture_output=True, text=True, encoding="utf-8",
-            errors="replace", timeout=timeout_s,
+            errors="replace", timeout=timeout_s, env=env,
         )
     except subprocess.TimeoutExpired:
         raise ExporterError(f"导出器超时（{timeout_s}s）：会话消息量可能过大，请缩小时间范围后重试") from None

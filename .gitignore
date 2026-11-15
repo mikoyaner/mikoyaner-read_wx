@@ -79,3 +79,6 @@ native/target/
 native/.tools/
 .pytest_cache/
 .zcode/
+
+# ----- 运行缓存（cache/ 里有密钥库 store.json，绝不入库）-----
+cache/
