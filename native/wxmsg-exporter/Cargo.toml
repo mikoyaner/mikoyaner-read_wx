@@ -1,0 +1,27 @@
+[package]
+name = "wxmsg-exporter"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "wxmsg-exporter"
+path = "src/main.rs"
+# 实现：单 bin crate，产物名 wxmsg-exporter.exe。
+# 功能：本项目的专用只读导出器（列账号/列会话/列群成员/读消息/导语音 blob）。
+
+[dependencies]
+anyhow.workspace = true
+serde_json.workspace = true
+ruzstd.workspace = true
+hex.workspace = true
+rusqlite.workspace = true
+weflow-core.workspace = true
+wcdb-native.workspace = true
+# 实现：五个依赖，全部走 workspace 统一版本。
+# 解析：weflow-core 提供 Account::open（开库+每库密钥解析）/messages（会话→消息表路由+时间窗流式读）/
+#       schema（列名候选匹配）；wcdb-native 提供 contacts::resolve_group_members（群成员双模型内省）
+#       与 media（语音 blob 定位）；ruzstd 供消息正文（zstd 压缩 BLOB 被 hex 化）解压；
+#       serde_json 承载全部 stdout 输出；anyhow 统一错误（Err → stderr + 退出码 1）。
+#       刻意不依赖 chrono/regex 等：时间格式化在 Python 侧做，XML 解析用朴素字符串处理。
+# 功能：声明导出器的全部编译依赖。

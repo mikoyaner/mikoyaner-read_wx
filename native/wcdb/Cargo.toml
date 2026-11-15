@@ -1,0 +1,21 @@
+[package]
+name = "wcdb-native"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "wcdb"
+# 移植改动：v1 这里是 ["cdylib"]（给 Node/koffi 当 DLL 用）。本项目把它当 Rust 库依赖
+# （wxmsg-exporter 要调 contacts::resolve_group_members / media 的语音内省），
+# 所以改成 rlib；不再产出 DLL。
+crate-type = ["rlib"]
+
+[dependencies]
+weflow-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+hex.workspace = true
+chrono.workspace = true
+rusqlite.workspace = true

@@ -1,0 +1,36 @@
+# 微信聊天记录提取软件 · 本机环境变量样例（复制为 .env，勿入库）
+#
+# 用法：复制本文件为项目根目录下的 .env，至少填 WXMSG_DATA_ROOT。
+# 敏感值（数据根路径含账号目录名）只存本机 .env，绝不写进代码仓库；
+# .env 已被 .gitignore 排除，误建的 config.env / *.env 同样被排除。
+
+# —— 必填 ——
+# 微信数据根：形如 <盘符>:/xwechat_files（微信 设置→文件管理 里可见的目录）。
+# 支持绝对路径、%USERPROFILE% 开头、相对项目根三种写法（由 wxmsg/config.py 统一解析）。
+# 不填的话，程序启动体检（面板首页）会直接报错拒绝往下走，绝不去猜微信装在哪。
+WXMSG_DATA_ROOT=
+
+# —— 可选（有合理默认值，通常不用填）——
+
+# Rust 导出器路径：默认按项目根解析为 bin/wxmsg-exporter.exe
+# WXMSG_EXPORTER_BIN=bin/wxmsg-exporter.exe
+
+# 导出结果目录：相对项目根；聊天记录明文落这里，已被 .gitignore 排除
+WXMSG_OUTPUT_DIR=output
+
+# 实时提取轮询间隔（秒；默认 60 = 每 1 分钟读一次增量）
+WXMSG_POLL_INTERVAL_S=60
+
+# 只读内存扫描取密钥的超时（秒，默认 900；微信刚启动时内存布局可能要等一会才出现）
+# WXMSG_KEYSCAN_TIMEOUT_S=900
+
+# 导出器子进程卡死保护（秒，默认 180；超时杀子进程并在面板报错）
+# WXMSG_EXPORTER_TIMEOUT_S=180
+
+# 语音 ASR 资源目录：指向 v1 项目根（其下应有 voice2text.cjs 与 vendor/ 子目录）。
+# 不填时程序自动尝试 ../Export_from_WeChat_v1；找不到或 node 不可用时，
+# 语音消息回退为 [语音] 占位符，不中断导出。
+# WXMSG_ASR_ROOT=../Export_from_WeChat_v1
+
+# Node 可执行文件（语音 ASR 用；默认 node，要求在 PATH 里）
+# WXMSG_NODE_BIN=node

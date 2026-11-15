@@ -1,0 +1,87 @@
+# ============================================================
+# 本仓库绝不允许入库的内容：API 密钥、账号信息、个人隐私、
+# 总结内容、视频内容、本机文件路径。
+# 注意：.gitignore 只能阻止未来的跟踪，抹不掉已进历史的内容；
+# 若发生误提交，需用 git filter-repo 清理历史并轮换泄露的密钥。
+# 项目产出新的敏感目录/文件类型时，必须同步补充本文件。
+# ============================================================
+
+# ----- API 密钥/凭据（apikey、token 等，绝不入库）-----
+.env
+*.env
+!*.env.example
+secrets.*
+*.key
+*.pem
+*.p12
+*.pfx
+credentials.json
+
+# ----- 账号信息（登录态、session、账号配置）-----
+*.session
+sessions/
+login_state/
+config/账号*.json
+config/account*.json
+
+# ----- 隐私信息（联系人档案、聊天记录等个人数据）-----
+联系人档案/
+聊天记录/
+profiles/
+exports/private/
+
+# ----- 总结内容（AI/工具生成的总结与分析产物）-----
+总结/
+summaries/
+*总结*.md
+*总结*.json
+*总结*.txt
+
+# ----- 视频内容（视频缓存/下载产物，体积大且可能含隐私）-----
+videos/
+video_cache/
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.webm
+*.flv
+
+# ----- 文件路径信息（本机路径登记/映射，暴露真实目录结构）-----
+paths.json
+pathmap.json
+*路径*.json
+*路径*.txt
+
+# ----- 通用运行产物/缓存 -----
+__pycache__/
+*.pyc
+*.pyo
+logs/
+*.log
+node_modules/
+.venv/
+venv/
+dist/
+build/
+.cache/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ----- 本项目构建产物与导出结果（导出文件含聊天明文，绝不入库）-----
+# bin/ 是 cargo 编译出的导出器 exe；native/target/ 与 native/.tools/ 是 Rust 构建缓存
+# 与便携工具链（与 v1 同口径，体积大且与机器绑定）；output/ 是聊天记录导出目录。
+output/
+bin/
+*.exe
+native/target/
+native/.tools/
+.pytest_cache/
+.zcode/
+
+# ----- 运行缓存（cache/ 里有密钥库 store.json，绝不入库）-----
+cache/
+
+# ----- 发版产物（dist/ 绿色包，不入库）-----
+dist/
