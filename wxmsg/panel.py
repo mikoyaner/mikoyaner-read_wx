@@ -576,14 +576,18 @@ function addFromResults(kind){
     added++;
   }
   renderSel(kind);
-  if(added && dup) alert(`已添加 ${added} 个；${dup} 个重复跳过`);
-  else if(added) show(document.getElementById(kind+"Count"),true,`已添加 ${added} 个`);
+  // 反馈并入计数 label（不覆盖掉 renderSel 刚设好的 x/20 计数口径）
+  const cnt = document.getElementById(kind+"Count");
+  cnt.textContent = `最多 ${SEL_CAP} 个（当前 ${targets.length}/${SEL_CAP}）—— 刚刚添加 ${added} 个`
+    + (dup ? `，重复跳过 ${dup} 个` : "");
 }
 function delSelected(kind){
   const el = document.getElementById(kind+"Sel");
-  const picks = [...el.selectedOptions].map(o=>+o.value);
+  // option 的 value 是条目 key（sid 或 sid|username），按 key 过滤而不是按位置——
+  // 两者不一致时会出现“点了删除却删不掉”的静默失败（真机冒烟抓到过）
+  const picks = [...el.selectedOptions].map(o=>o.value);
   if(!picks.length){ alert("请先在已选列表里选中要删除的条目"); return; }
-  S[kind+"Targets"] = S[kind+"Targets"].filter((_,i)=>!picks.includes(i));
+  S[kind+"Targets"] = S[kind+"Targets"].filter(t=>!picks.includes(t.key));
   renderSel(kind);
 }
 function renderSel(kind){
