@@ -383,8 +383,10 @@ pub struct MemberRow {
 
 /// 解析群成员：
 /// 模型 A —— 群"联系人"行内的 user_name_list / display_name_list（分隔符切分）；
-/// 模型 B —— 每成员一行的表（含 chatroom_id + username 列）。
-/// 移植改动：fn 从私有提为 pub，供 wxmsg-exporter 调用；函数体未动。
+/// 模型 B —— 每成员一行的表（含 chatroom_id + username 列）；
+/// 模型 C —— 微信 4.1.15 实测的整数外键三表关联（chatroom_member.room_id → chat_room.id，
+///           chatroom_member.member_id → name2id.rowid，成员 username 经 name2id 反查）。
+/// 移植改动：fn 从私有提为 pub，供 wxmsg-exporter 调用；新增模型 C。
 pub fn resolve_group_members(account: &Account, chatroom_id: &str) -> Result<Vec<MemberRow>> {
     // 无 contact 库：群成员无从解析，回空数组（调用方按 0 成员降级）
     let Some(db) = contact_db_path(account) else {
@@ -461,13 +463,68 @@ pub fn resolve_group_members(account: &Account, chatroom_id: &str) -> Result<Vec
         }
         Ok(Vec::new())
     })?;
+    // 模型 C（微信 4.1.15 实测）：成员存成整数外键——chatroom_member(room_id, member_id)，
+    // room_id → chat_room.id，member_id → name2id.rowid，成员 username 经 name2id 反查。
+    // A/B 找的是文本形态（列/表），在 4.1.15 上全部落空，所以这里补整数关联这一路。
+    // 三张表缺任一（旧版本微信）则跳过模型 C。
+    if !found.is_empty() {
+        return Ok(found);
+    }
+    let has_tables = account.with_conn(&db, |conn| {
+        let tables = list_tables(conn)?;
+        let names: Vec<String> = tables.iter().map(|t| t.to_ascii_lowercase()).collect();
+        Ok(names.contains(&"chatroom_member".to_string())
+            && names.contains(&"chat_room".to_string())
+            && names.iter().any(|n| n == "name2id"))
+    })?;
+    if has_tables {
+        let joined = account.with_conn(&db, |conn| -> Result<Vec<MemberRow>> {
+            // 表名/列名均为诊断实测的固定值（4.1.15 schema），仍过 sanitize_ident 防拼接
+            let (t_cm, t_cr, t_n2) = (
+                sanitize_ident("chatroom_member")?,
+                sanitize_ident("chat_room")?,
+                sanitize_ident("name2id")?,
+            );
+            let (c_rm, c_mi, c_cr_id, c_cr_un, c_n2_un) = (
+                sanitize_ident("room_id")?,
+                sanitize_ident("member_id")?,
+                sanitize_ident("id")?,
+                sanitize_ident("username")?,
+                // contact 库 name2id 的名称列是 username（message 库的 Name2Id 才是 user_name
+                // ——同名异构，实测踩坑：列名写错会以 "no such column" 静默落进发言者池回退）
+                sanitize_ident("username")?,
+            );
+            let sql = format!(
+                "SELECT \"{t_n2}\".\"{c_n2_un}\" FROM \"{t_cm}\" \
+                 JOIN \"{t_cr}\" ON \"{t_cm}\".\"{c_rm}\" = \"{t_cr}\".\"{c_cr_id}\" \
+                 JOIN \"{t_n2}\" ON \"{t_n2}\".rowid = \"{t_cm}\".\"{c_mi}\" \
+                 WHERE \"{t_cr}\".\"{c_cr_un}\" = ?"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let mut rows = stmt.query([chatroom_id])?;
+            let mut out: Vec<MemberRow> = Vec::new();
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+            while let Some(r) = rows.next()? {
+                let username: String = r.get(0)?;
+                if username.trim().is_empty() || !seen.insert(username.clone()) {
+                    continue;
+                }
+                out.push(MemberRow { username, display: None });
+            }
+            Ok(out)
+        })?;
+        if !joined.is_empty() {
+            return Ok(joined);
+        }
+    }
     Ok(found)
-    // ① 实现方式：双模型级联——先按模型 A 查群"联系人"行内的 user_name_list/
-    //    display_name_list（分隔符切分、下标对齐），落空再按模型 B 遍历 contact 库找同时
-    //    含 chatroom_id 与 username 列的成员表，按群 id 参数化查询逐成员行。
+    // ① 实现方式：三模型级联——A 群联系人行成员列表列 → B 文本成员表（chatroom_id+username
+    //    列）→ C 整数外键关联（4.1.15 实测：chatroom_member.room_id→chat_room.id，
+    //    chatroom_member.member_id→name2id.rowid，username 经 name2id 反查）。
     // ② 关键程序解析：模型 A 的 display 与 username 按切分后下标一一对应，越界取 None；
-    //    模型 B 表命中后仍要求查询结果非空才返回，避免无关表误判导致永远空成员；两模型
-    //    都失败回空数组，全部 SQL 标识符过 sanitize_ident，群 id 走 ? 绑定。
+    //    模型 B 命中后仍要求查询结果非空才返回；模型 C 用 INNER JOIN（name2id 查不到的
+    //    成员 ID 被丢弃）+ seen 去重；三模型全部失败回空数组；全部 SQL 标识符过
+    //    sanitize_ident，群 id 走 ? 绑定。
     // ③ 功能：解析群成员名单（username + 可选群昵称），成员数/成员列表导出的公共数据层。
 }
 
