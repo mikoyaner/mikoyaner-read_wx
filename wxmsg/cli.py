@@ -191,13 +191,13 @@ def run_export(cfg: Config, targets: list[Target], fmt: str = "csv", *,
         for ps in per_session:
             all_records.extend(ps["records"])
         path = out_dir / outfile.merged_filename(fmt, now)
-        _write(fmt, path, all_records)
+        _write_guarded(fmt, path, all_records)
         files.append({"sid": "", "display": "(合并)", "chat_type": -1,
                       "count": len(all_records), "path": str(path)})
     else:
         for ps in per_session:
             path = out_dir / outfile.session_filename(ps["chat_type"], ps["display"], fmt, now)
-            _write(fmt, path, ps["records"])
+            _write_guarded(fmt, path, ps["records"])
             files.append({"sid": ps["sid"], "display": ps["display"],
                           "chat_type": ps["chat_type"], "count": ps["count"],
                           "path": str(path)})
@@ -226,6 +226,20 @@ def _write(fmt: str, path: Path, records: list[dict]) -> None:
     # 实现：csv/json 覆盖写直通；jsonl 明确拒绝。
     # 解析：明确报错优于静默写出一个既像 JSON 又不是数组的文件。
     # 功能：格式分发。
+
+
+def _write_guarded(fmt: str, path: Path, records: list[dict]) -> None:
+    """带占用翻译的落盘：文件被 WPS/Excel 独占（Windows 常见）时给可操作文案。
+
+    PermissionError 译成 ValueError 抛出——面板 _api 层对 ValueError 有统一的
+    ok:false 展示通道，用户能看到"关掉 WPS 再导"而不是裸 [Errno 13]。"""
+    try:
+        _write(fmt, path, records)
+    except PermissionError:
+        raise ValueError(
+            f"导出文件被 WPS/Excel 占用：请关闭打开的「{path.name}」后重新导出") from None
+    # 实现：仅翻译 PermissionError，其余异常原样传播。
+    # 功能：历史导出落盘的占用防御（与实时轮询的同类文案对齐）。
 
 
 def main(argv=None) -> int:

@@ -251,6 +251,17 @@ class App:
         #       与 config 口径一致。页面关闭不影响线程（这就是服务端驱动的意义）。
         # 功能：实时监听的启动 API（后台化改造）。
 
+    @staticmethod
+    def _friendly_poll_error(e: Exception) -> str:
+        """轮询失败的面向用户文案：把常见错误翻译成可操作提示。"""
+        if isinstance(e, PermissionError):
+            return ("导出文件被占用（多半是 WPS/Excel 正开着它）——关闭文件后，"
+                    "下一轮会自动补写错过的消息，已提取的数据不会丢")
+        return f"{type(e).__name__}: {e}"
+        # 实现：PermissionError 单列（Windows 文件独占锁是实时场景最高频故障），
+        # 其余保留类型名+原文。
+        # 功能：面板实时状态里"最近一次轮询出错"的可读文案。
+
     def _rt_loop(self, rt, stop_event: threading.Event, interval_s: int) -> None:
         """实时线程主循环：poll → 打一行摘要（不含消息内容）→ 等间隔或停止事件。"""
         while not stop_event.is_set():
@@ -260,7 +271,7 @@ class App:
                 print(f"[realtime] {result['at']} 新增 {result['new_total']} 条 "
                       f"（累计 {sum(s['total'] for s in result['sessions'])}）")
             except Exception as e:  # noqa: BLE001  轮询失败不退出循环——下一轮可能自愈
-                self._rt_error = f"{type(e).__name__}: {e}"
+                self._rt_error = self._friendly_poll_error(e)
                 print(f"[realtime] 轮询失败（下一轮重试）：{self._rt_error}")
             if stop_event.wait(interval_s):
                 break
@@ -349,9 +360,13 @@ class _Handler(BaseHTTPRequestHandler):
             return {"ok": False, "error": f"未知接口 {name}"}
         except exporter.ExporterError as e:
             return {"ok": False, "error": str(e)}
+        except PermissionError as e:
+            return {"ok": False, "error": (
+                "导出文件被占用（多半是 WPS/Excel 正开着它）——关闭文件后重试")}
         except (ValueError, FileNotFoundError) as e:
             return {"ok": False, "error": str(e)}
-        # 实现：setup 模式闸 → 按名字分发到 App 方法；match 是新增的按名字选择接口。
+        # 实现：setup 模式闸 → 按名字分发到 App 方法；PermissionError（文件被 WPS/Excel
+        # 独占）给可操作文案。
         # 解析：刻意不裸接 Exception——真 bug 让它抛出去打日志，而不是被包装成"业务失败"。
         # 功能：API 层的统一错误协议。
 
@@ -469,7 +484,7 @@ PAGE = """<!DOCTYPE html>
  <div id="realtimeOpts" style="display:none">
   <label><input type="checkbox" id="includeHistory">启动时同时导出历史消息（写进同一个实时文件）</label>
   （可叠加下方时间范围/最近N）
-  <div class="muted">启动后：黑窗口每分钟提取一次，<b>关闭浏览器页面不影响</b>；重新打开面板能看到运行状态。</div>
+  <div class="muted">启动后：黑窗口每分钟提取一次，<b>关闭浏览器页面不影响</b>；重新打开面板能看到运行状态。运行期间请勿用 WPS/Excel 打开正在写入的实时文件（会锁文件导致轮询失败；关闭后下一轮自动补写，数据不丢）。</div>
  </div>
  <div style="margin-top:6px">
   格式 <select id="fmt"><option value="csv">CSV（Excel）</option><option value="json">JSON（实时=JSONL追加）</option></select>

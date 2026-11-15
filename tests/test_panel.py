@@ -248,6 +248,20 @@ class TestHttpApi:
         # 功能：实时后台生命周期协议。
 
 
+class TestFriendlyPollError:
+    def test_permission_translated(self):
+        e = PermissionError(13, "Permission denied")
+        msg = panel.App._friendly_poll_error(e)
+        assert "WPS/Excel" in msg and "补写" in msg and "不会丢" in msg
+        # 实现：文件占用错误 → 可操作文案（关闭文件后下一轮自动补写，数据不丢）。
+        # 功能：实时轮询最高频故障的可读提示。
+
+    def test_other_keeps_type(self):
+        msg = panel.App._friendly_poll_error(ValueError("xxx"))
+        assert msg == "ValueError: xxx"
+        # 功能：非占用错误保留原始类型与信息。
+
+
 class TestSetupMode:
     def test_setup_flow_over_http(self, tmp_path, monkeypatch):
         # 把"项目根"重定向到 tmp：App.setup 写 .env、load_config 读 .env 都落在 tmp 里，

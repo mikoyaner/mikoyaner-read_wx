@@ -206,3 +206,16 @@ class TestRunExport:
                            argv_prefix=_make_prefix(tmp_path))
         # 实现：jsonl 是实时专用格式，历史导出明确拒绝。
         # 功能：格式防线。
+
+    def test_locked_file_translated(self, tmp_path, monkeypatch):
+        # 目标文件被 WPS/Excel 独占（写盘抛 PermissionError）→ 可操作文案而不是裸 Errno 13
+        def locked(path, records):
+            raise PermissionError(13, "Permission denied")
+        monkeypatch.setattr(cli.outfile, "write_csv", locked)
+        with pytest.raises(ValueError, match="WPS/Excel"):
+            cli.run_export(cfg := _cfg(tmp_path),
+                           [Target(sid="wxid_a", chat_type=1, display="张三")],
+                           fmt="csv", now=datetime(2026, 1, 1),
+                           argv_prefix=_make_prefix(tmp_path))
+        # 实现：cli._write_guarded 把 PermissionError 译成带指引的 ValueError（面板可展示）。
+        # 功能：历史导出的文件占用防御。
