@@ -55,7 +55,7 @@
 ## 首次使用（5 步）
 
 1. **双击 `start_panel.bat`** —— 黑色控制台窗口出现（它就是服务本体，全程保持开着，可最小化），浏览器自动打开面板
-2. **首次配置**：在页面上填微信数据根（微信「设置 → 文件管理」里显示的路径，如 `E:/xwechat_files`）→ 保存，自动生成 `.env`，之后不再询问
+2. **首次配置**：在页面上填微信数据根（微信「设置 → 文件管理」里显示的路径，如 `<你的微信数据根>`）→ 保存，自动生成 `.env`，之后不再询问
 3. **点「开始体检」**：确认导出器就绪、账号密钥可用（首次会自动只读扫描微信进程内存取密钥，约几十秒）
 4. **选择会话**：在②区搜索名字 → 结果列表 Ctrl 多选 → 确认添加（搜索词会进历史，下次输入自动联想）
 5. **导出**：切到「历史导出」点开始；或切到「实时监听」开始后台提取
@@ -113,10 +113,10 @@
 **进一步诊断**：命令行进入项目目录，运行下表命令（输出 JSON，仅供自查，不要外发——含会话结构信息）：
 
 ```bat
-bin\wxmsg-exporter.exe --data-root E:\xwechat_files --list-accounts        :: 账号+密钥状态
-bin\wxmsg-exporter.exe --data-root E:\xwechat_files --list-sessions        :: 会话清单
-bin\wxmsg-exporter.exe --data-root E:\xwechat_files --group-members-all    :: 全群成员索引（含来源与统计）
-bin\wxmsg-exporter.exe --data-root E:\xwechat_files --dump-contact-schema  :: 微信库表结构（定位 schema 变化）
+bin\wxmsg-exporter.exe --data-root <你的微信数据根> --list-accounts        :: 账号+密钥状态
+bin\wxmsg-exporter.exe --data-root <你的微信数据根> --list-sessions        :: 会话清单
+bin\wxmsg-exporter.exe --data-root <你的微信数据根> --group-members-all    :: 全群成员索引（含来源与统计）
+bin\wxmsg-exporter.exe --data-root <你的微信数据根> --dump-contact-schema  :: 微信库表结构（定位 schema 变化）
 ```
 
 微信版本升级后若出现「密钥打不开/成员为空」，先跑 `--dump-contact-schema` 对比结构变化，再反馈。
@@ -182,6 +182,32 @@ start_panel.bat
         ├─ outfile.py（CSV/JSON/JSONL 落盘）
         └─ realtime.py（游标增量去重，后台线程每分钟一轮）
 ```
+
+## 从零部署（新机器上从 GitHub 拉下来）
+
+**仓库里有什么、缺什么**：源码、测试、配置样例全部齐全；Python 运行时**零第三方依赖**。
+但以下三样因性质特殊**不在仓库里**，需要自行准备：
+
+| 缺什么 | 为什么不在仓库 | 怎么补 |
+|---|---|---|
+| `bin/wxmsg-exporter.exe`（Rust 导出器编译产物） | 二进制不入库 | 自行编译（见下），或从可信渠道获取他人编译的 exe |
+| 密钥库 `cache/keystore/store.json` | 密钥只存在于本机运行中的微信进程内存，**天然无法上传** | 微信登录后点「重扫密钥」自动生成 |
+| `.env`（数据根等本机配置） | 含本机路径，不入库 | 首次启动在面板配置页填写，自动生成 |
+
+**编译导出器（一次）**：
+
+```bat
+:: 前置：安装 Rust(rustup) 与 Strawberry Perl（编译内置 OpenSSL 必需）
+cd native
+cargo build --release -p wxmsg-exporter
+copy target\release\wxmsg-exporter.exe ..\bin\
+```
+
+首次编译约数分钟（OpenSSL 从源码构建）；`Cargo.lock` 已锁定依赖版本，配合
+`.cargo/config.toml` 的镜像配置可直接拉取。
+
+**可选增强**：语音转文字需要 Node + SenseVoice 模型目录（约 250MB，不随仓库分发）——
+设置 `WXMSG_ASR_ROOT` 指向包含 `voice2text.cjs` 的目录即可；不配置则语音显示 `[语音]` 占位符，其余功能不受影响。
 
 ## 开发与测试
 
