@@ -7,6 +7,7 @@
 //!   wxmsg-exporter --data-root <微信数据根> --list-accounts
 //!   wxmsg-exporter --data-root <微信数据根> --list-sessions [--account <账号目录名|wxid>]
 //!   wxmsg-exporter ... --group-members --sid <群id>
+//!   wxmsg-exporter ... --group-members-all        （全群成员索引：roster+发言者池回退）
 //!   wxmsg-exporter ... --messages --sid <会话id> [--begin 秒] [--end 秒] [--recent N]
 //!                      [--voice-out <语音落盘目录>]
 //!   wxmsg-exporter --version
@@ -588,6 +589,130 @@ fn login_guard_fields(data_root: &str, acct_dir: &Path) -> (String, String, bool
     // 功能：换号防线的判定数据源。
 }
 
+/// 群成员候选的 sender_pool 回退：取该群最近 n 条消息，把发送者（real_sender_id→Name2Id
+/// 反查）去重后作为成员候选。微信 4.1.15 实测：wcdb 的成员表双模型对所有群返回空
+/// （无 error），发言者池是唯一可靠来源，故 roster 为空时必须走这里。
+fn sender_pool(
+    account: &Account,
+    sid: &str,
+    names: &HashMap<String, NameInfo>,
+    n: usize,
+) -> Result<Vec<Value>> {
+    let n2i = load_name2id_all(account);
+    let (rows, _route, _tf) = session_message_rows_recent_routed(account, sid, n)?;
+    let mut seen: Vec<String> = Vec::new();
+    for row in &rows {
+        let m = match row.as_object() {
+            Some(m) => m,
+            None => continue,
+        };
+        let mut sender = as_str(ci_get(m, "sender_username"));
+        if sender.is_empty() {
+            let db_name = as_str(ci_get(m, "db_name")).to_lowercase();
+            let rid = as_i64(ci_get(m, "real_sender_id").or_else(|| ci_get(m, "realSenderId")));
+            if rid != 0 {
+                if let Some(uname) = n2i.get(&db_name).and_then(|mp| mp.get(&rid)) {
+                    sender = uname.clone();
+                }
+            }
+        }
+        // 发送者反查与 run_messages 的消息行同口径；空白跳过，按首次出现顺序去重。
+        if !sender.is_empty() && !seen.contains(&sender) {
+            seen.push(sender);
+        }
+    }
+    Ok(seen
+        .into_iter()
+        .map(|u| {
+            let info = names.get(&u);
+            json!({
+                "username": u,
+                "group_display": Value::Null,   // 发言者池拿不到群内昵称，如实为 null
+                "remark": info.map(|x| x.remark.clone()).unwrap_or_default(),
+                "nickname": info.map(|x| x.nickname.clone()).unwrap_or_default(),
+                "alias": info.map(|x| x.alias.clone()).unwrap_or_default(),
+                "source": "sender_pool",
+            })
+        })
+        .collect())
+    // 实现：复用 --messages 的取数与发送者反查链路（最近 n 条，LIMIT 下推，快）。
+    // 解析：发言者池 ≠ 全群名册——从没在窗口内发言的人不在池里；面板按 source 标注口径。
+    // 功能：成员表失效时的成员搜索数据源（诊断实测：本机 4.1.15 上是主来源）。
+}
+
+/// --group-members-all：一次性遍历数据根下当前账号的**全部群聊**，产出成员搜索索引。
+/// 每群先走 wcdb 双模型（roster），为空则回退 sender_pool（最近 POOL_N 条消息）。
+fn run_group_members_all(ks: &KeyStore, data_root: &str, pretty: bool) -> Result<()> {
+    const POOL_N: usize = 500;
+    let (acct_dir, account, _) = pick_account_opened(ks, data_root, None, None)?;
+    let names = build_names(&account);
+    // 会话清单里筛群聊（群 = @chatroom）：只有会话里出现过的群才有本地消息，值得索引。
+    let chatrooms: Vec<(String, String)> = list_session_rows(&account)
+        .into_iter()
+        .filter(|(sid, _, _)| is_group(sid))
+        .map(|(sid, disp, _)| (sid, disp))
+        .collect();
+    let mut groups: Vec<Value> = Vec::with_capacity(chatrooms.len());
+    let mut roster_ok = 0usize;
+    let mut pool_used = 0usize;
+    for (sid, disp) in &chatrooms {
+        let (members, err) = match resolve_group_members(&account, sid) {
+            Ok(v) if !v.is_empty() => {
+                roster_ok += 1;
+                (
+                    v.into_iter()
+                        .map(|m| {
+                            let info = names.get(&m.username);
+                            json!({
+                                "username": m.username,
+                                "group_display": m.display,
+                                "remark": info.map(|x| x.remark.clone()).unwrap_or_default(),
+                                "nickname": info.map(|x| x.nickname.clone()).unwrap_or_default(),
+                                "alias": info.map(|x| x.alias.clone()).unwrap_or_default(),
+                                "source": "roster",
+                            })
+                        })
+                        .collect::<Vec<_>>(),
+                    None,
+                )
+            }
+            _ => {
+                pool_used += 1;
+                let pool = sender_pool(&account, sid, &names, POOL_N).unwrap_or_default();
+                (
+                    pool,
+                    Some("member_table_empty_fallback_sender_pool".to_string()),
+                )
+            }
+        };
+        groups.push(json!({
+            "sid": sid,
+            "name": disp,
+            "count": members.len(),
+            "members": members,
+            "error": err,
+        }));
+    }
+    let (serving_wxid, current_login_wxid, serves_current_login) =
+        login_guard_fields(data_root, &acct_dir);
+    emit(&json!({
+        "mode": "group_members_all",
+        "account_dir": acct_dir.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default(),
+        "serving_wxid": serving_wxid,
+        "current_login_wxid": current_login_wxid,
+        "serves_current_login": serves_current_login,
+        "groups_total": chatrooms.len(),
+        "roster_ok": roster_ok,
+        "pool_used": pool_used,
+        "groups": groups,
+    }), pretty);
+    Ok(())
+    // 实现：选号 → 筛群 → 逐群 roster/sender_pool 双路 → 汇总输出（含统计）。
+    // 解析：单进程单 contact.db 打开，47 个群实测毫秒级；回退群才开消息库（LIMIT 下推）。
+    //       error 字段把回退原因带到前端（诊断不再被吞）。
+    // 功能：面板「群聊+成员搜索」索引的数据源。
+}
+
 /// 选当前登录账号并直接交付已打开的 Account：数据根下「session.db 最近被写过且密钥能开库」的那只。
 /// 与 v1 pick_account_dir 的差异：① 本项目数据根必填且强校验，不做"根外兜底"（绝不静默读别的目录）；
 /// ② 直接返回 Arc<Account>，调用方不必重复开库验钥；③ 支持 wanted_sid——优先选「库里真有这个会话」
@@ -997,6 +1122,7 @@ struct Args {
     list_accounts: bool,
     list_sessions: bool,
     group_members: bool,
+    group_members_all: bool,
     messages: bool,
     pretty: bool,
     version: bool,
@@ -1016,6 +1142,7 @@ fn parse_args(argv: &[String]) -> Args {
         list_accounts: false,
         list_sessions: false,
         group_members: false,
+        group_members_all: false,
         messages: false,
         pretty: false,
         version: false,
@@ -1047,6 +1174,7 @@ fn parse_args(argv: &[String]) -> Args {
             "--list-accounts" => a.list_accounts = true,
             "--list-sessions" => a.list_sessions = true,
             "--group-members" => a.group_members = true,
+            "--group-members-all" => a.group_members_all = true,
             "--messages" => a.messages = true,
             "--pretty" => a.pretty = true,
             "--version" | "-V" => a.version = true,
@@ -1097,8 +1225,9 @@ fn main() {
 }
 
 fn run(args: Args) -> Result<()> {
-    if !args.list_accounts && !args.list_sessions && !args.group_members && !args.messages {
-        bail!("必须指定模式：--list-accounts / --list-sessions / --group-members / --messages（--version 查看用法）");
+    if !args.list_accounts && !args.list_sessions && !args.group_members
+        && !args.group_members_all && !args.messages {
+        bail!("必须指定模式：--list-accounts / --list-sessions / --group-members / --group-members-all / --messages（--version 查看用法）");
     }
     let data_root = match &args.data_root {
         Some(r) if !r.trim().is_empty() => r.clone(),
@@ -1122,6 +1251,9 @@ fn run(args: Args) -> Result<()> {
             &ks, &data_root, args.account.as_deref(),
             args.sid.as_deref().unwrap_or(""), args.pretty,
         );
+    }
+    if args.group_members_all {
+        return run_group_members_all(&ks, &data_root, args.pretty);
     }
     run_messages(
         &ks, &data_root, args.account.as_deref(),
