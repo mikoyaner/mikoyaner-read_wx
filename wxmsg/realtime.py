@@ -95,32 +95,47 @@ class RealtimeExport:
         self.states: dict = {}
         # 文件按组织方式分配：合并 → 单文件；分文件 → 每会话一个。
         self.path_merged = out_dir / outfile.realtime_filename(self.fmt, self.started)
+        self._history_pending: list[dict] = []   # 待后台线程执行的历史初始化参数
         for t in targets:
             path = self.path_merged if merged else \
                 out_dir / outfile.realtime_session_filename(t.chat_type, t.display, self.fmt, self.started)
-            # 初始游标：不导历史 = 启动时刻（只收启动后的新消息）；
-            # 导历史 = 先把历史写进文件，游标推到已写到的最大行键。
-            if include_history:
-                fetch = cli._fetch_messages(cfg, t, history_begin, history_end, history_recent,
-                                            self.voice_dir, argv_prefix=argv_prefix,
-                                            rescan=rescan, log=log)
-                records = self._records(t, fetch.rows)
-                self._append(path, records)
-                # 游标锚在**原始窗口末端**（筛选前），而不是筛选后的行集：
-                # 成员筛选可能把窗口内行全部滤掉（该成员最近没发言），此时锚点若落回
-                # 起点或筛选空集，下一轮增量会把整段历史全拉回来（真机踩到：
-                # recent=10 却导出 1799 条）。原始末端之后的消息才是"新消息"。
-                cursor = fetch.raw_last_key or (0, 0, 0)
-                count = len(records)
-            else:
-                cursor = (int(self.started.timestamp()), 0, 0)
-                count = 0
-            self.states[t.sid] = _State(target=t, cursor=cursor, path=path, count=count)
-        # 实现：构造即完成"起点"语义——include_history 决定游标从 0（历史全量）还是启动时刻起算。
-        # 解析：include_history 时历史与新消息进同一个文件（用户拍板"先导历史再实时追加"，
-        #       而不是出两个文件）；游标取 fetch 行的最大键，同秒末条之后的新消息下一轮必收。
-        # 功能：实时监听的起点。
+            # 初始游标：include_history 时**不在此处取数**——大历史提取（含语音 ASR）可能
+            # 耗时数分钟，同步做会让启动请求长时间停在「启动中…」（真机验收踩到）。
+            # 历史提取挪到 run_history_init()，由后台线程第一轮执行；未启用时游标=启动时刻。
+            cursor = (int(self.started.timestamp()), 0, 0)
+            self.states[t.sid] = _State(target=t, cursor=cursor, path=path, count=0)
+        if include_history:
+            self._history_pending = [{"begin": history_begin, "end": history_end,
+                                      "recent": history_recent}]
+            self.states = {t.sid: _State(target=t, cursor=(0, 0, 0),
+                                         path=self.states[t.sid].path, count=0)
+                           for t in targets}
+        # 实现：构造只做轻量工作（索引/文件分配/游标占位），历史提取延迟到后台线程第一轮。
+        # 解析：include_history 时游标暂置 (0,0,0)——run_history_init 完成后会把游标推到
+        #       原始窗口末端（raw_last_key），其间不产生任何轮询（线程先跑初始化再进循环）。
+        # 功能：实时监听的起点（无阻塞启动）。
         self.last_poll = self.started.strftime("%Y-%m-%d %H:%M:%S")
+
+    def run_history_init(self) -> None:
+        """后台线程第一轮：执行 include_history 的历史提取并锚定游标（未启用则跳过）。
+
+        必须在 poll_once 之前调用一次——它把游标从 (0,0,0) 占位推到原始窗口末端，
+        之后的增量轮次才能正确去重（真机踩过：跳过这步会把整段历史当增量拉回）。"""
+        if not self._history_pending:
+            return
+        p = self._history_pending[0]
+        for st in self.states.values():
+            fetch = cli._fetch_messages(self.cfg, st.target, p["begin"], p["end"], p["recent"],
+                                        self.voice_dir, argv_prefix=self._argv_prefix,
+                                        rescan=self._rescan)
+            records = self._records(st.target, fetch.rows)
+            self._append(st.path, records)
+            st.cursor = fetch.raw_last_key or (0, 0, 0)
+            st.count = len(records)
+        self._history_pending = []
+        # 实现：与 __init__ 旧逻辑一致的历史提取，只是执行时机移到后台线程第一轮。
+        # 解析：游标锚 raw_last_key（筛选前原始窗口末端）——成员筛选 0 条时不回爆全历史。
+        # 功能：include_history 的非阻塞执行。
 
     def _records(self, target: cli.Target, rendered_rows: list[dict]) -> list[dict]:
         """渲染行 → 6 字段记录（字段③口径与历史导出一致：私聊 null，群聊走组合名映射）。"""

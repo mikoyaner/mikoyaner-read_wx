@@ -216,6 +216,9 @@ class TestHttpApi:
             def __init__(self, cfg, targets, **kw):
                 started["targets"] = targets
                 started["include_history"] = kw.get("include_history")
+                started["init_ran"] = False
+            def run_history_init(self):
+                started["init_ran"] = True      # 后台线程第一轮应调用历史初始化
             def poll_once(self):
                 polls["n"] += 1
                 return {"new_total": 1, "sessions": [
@@ -233,6 +236,7 @@ class TestHttpApi:
         out = _post(server, "/api/realtime/state")
         assert out["ok"] is True and out["running"] is True
         assert out["total"] >= 1                         # 服务端在跑（页面无关）
+        assert started["init_ran"] is True               # 后台线程第一轮执行了历史初始化
         out = _post(server, "/api/realtime/stop")
         assert out["ok"] is True and out["stopped"] is True
         n_at_stop = polls["n"]

@@ -94,6 +94,7 @@ class TestRealtimeStart:
         rt = realtime.RealtimeExport(cfg, [_target()], fmt="json", merged=True,
                                      include_history=True, now=datetime(2026, 1, 1, 0, 0, 0),
                                      argv_prefix=_make_prefix(tmp_path, _ROWS))
+        rt.run_history_init()                        # 历史提取已挪到后台线程首轮，测试显式调用
         # 初始：全部 5 条进文件（json 格式自动换成 jsonl）
         assert rt.fmt == "jsonl"
         assert rt.summary()["total"] == 5
@@ -120,6 +121,7 @@ class TestRealtimeStart:
         rt = realtime.RealtimeExport(cfg, [_target()], fmt="csv", merged=True,
                                      include_history=True, now=datetime(2026, 1, 1),
                                      argv_prefix=_make_prefix(tmp_path, rows_v1))
+        rt.run_history_init()
         assert rt.summary()["total"] == 2                    # 90 + 100(seq1)
         out = rt.poll_once(argv_prefix=_make_prefix(tmp_path, rows_v2))
         assert out["new_total"] == 1                         # 只有"第一秒B"是新的
@@ -136,6 +138,7 @@ class TestRealtimeStart:
         rt = realtime.RealtimeExport(cfg, [t1, t2], fmt="json", merged=False,
                                      include_history=True, now=datetime(2026, 1, 1),
                                      argv_prefix=_make_prefix(tmp_path, _ROWS))
+        rt.run_history_init()
         files = rt.summary()["files"]
         assert len(files) == 2
         assert files[0]["path"].endswith("实时_私聊_张三_20260101_000000.jsonl")
@@ -156,6 +159,7 @@ class TestRealtimeStart:
                                      fmt="csv", merged=True, include_history=True,
                                      history_recent=10, now=datetime(2026, 1, 1),
                                      argv_prefix=_make_prefix(tmp_path, rows))
+        rt.run_history_init()
         assert rt.summary()["total"] == 0                 # 窗口内没有目标成员的消息
         out = rt.poll_once(argv_prefix=_make_prefix(tmp_path, rows))
         assert out["new_total"] == 0                      # 不回爆全历史

@@ -263,7 +263,12 @@ class App:
         # 功能：面板实时状态里"最近一次轮询出错"的可读文案。
 
     def _rt_loop(self, rt, stop_event: threading.Event, interval_s: int) -> None:
-        """实时线程主循环：poll → 打一行摘要（不含消息内容）→ 等间隔或停止事件。"""
+        """实时线程主循环：历史初始化（如启用）→ 轮询循环 → 停止事件退出。"""
+        try:
+            rt.run_history_init()   # include_history 的历史提取在此执行（可能耗时数分钟）
+        except Exception as e:  # noqa: BLE001
+            self._rt_error = self._friendly_poll_error(e)
+            print(f"[realtime] 历史初始化失败（增量轮次继续）：{self._rt_error}")
         while not stop_event.is_set():
             try:
                 result = rt.poll_once()
@@ -654,7 +659,13 @@ async function rtToggle(){
   params.fmt=document.getElementById("fmt").value;
   params.merged=document.querySelector('input[name=org][value=merged]').checked;
   params.include_history=document.getElementById("includeHistory").checked;
-  if(params.include_history){ Object.assign(params,timeParams()); }
+  if(params.include_history){
+    // timeParams 的键名是 begin/end/recent（历史导出用），实时启动读的是
+    // history_begin/history_end/history_recent——这里必须改名映射（键名不一致曾导致
+    // 「最近N条/时间范围」静默失效，导出了全历史）
+    const tp=timeParams();
+    params.history_begin=tp.begin; params.history_end=tp.end; params.history_recent=tp.recent;
+  }
   params.interval_s=+document.getElementById("pollInterval").value||60;
   st.textContent="启动中…";
   const d=await api("realtime/start",params);
