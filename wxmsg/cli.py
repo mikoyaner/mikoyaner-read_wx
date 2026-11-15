@@ -240,11 +240,23 @@ def main(argv=None) -> int:
             except ValueError:
                 print(f"[用法错误] --port 需要数字端口，收到 {argv[i + 1]!r}")
                 return 2
+    # 运行缓存全部落在项目 cache/ 下（用户拍板：不写 C 盘）；首次启动把 v1 旧密钥库迁过来。
+    from . import keys as _keys
+    note = _keys.migrate_legacy_store()
+    if note:
+        print(f"[keys] {note}")
     try:
         cfg = load_config()
-    except ConfigError as e:
-        print(f"[配置错误] {e}")
-        return 2
+    except ConfigError:
+        # 首次运行（或 .env 缺数据根）不再是死路：进面板 setup 模式，页面上填路径自动写 .env。
+        print("[配置] 尚未配置微信数据根——面板已启动，请在打开的页面上填写（自动写入 .env）")
+        from . import panel
+        try:
+            panel.serve(None, port=port)
+        except OSError as e:
+            print(f"[启动失败] 端口 {port} 可能被占用（{e}）。换个端口：python -m wxmsg.cli --port 8766")
+            return 1
+        return 0
     # panel 在函数内导入而非模块顶部：panel→cli 与 cli→panel 双向引用，顶层互导有初始化顺序风险，
     # 函数内导入让两边都加载完成后再建立引用，稳妥且对正常使用无影响。
     from . import panel

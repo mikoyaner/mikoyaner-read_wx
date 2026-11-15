@@ -28,7 +28,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from . import cli, exporter, keys, session as session_mod
-from .config import Config
+from .config import KEY_DATA_ROOT, Config, load_config, set_env_key
 
 # 实现：import 标准库 HTTP 三件套 + 同包编排模块。
 # 解析：session 模块起名 session 与 http 的概念无冲突，但为可读性 import as session_mod。
@@ -97,16 +97,50 @@ def _targets_from_params(params: dict) -> list[cli.Target]:
 
 
 class App:
-    """面板后端状态：配置 + 实时任务单例 + 导出锁。"""
+    """面板后端状态：配置（setup 模式下可为 None）+ 实时任务单例 + 导出锁。"""
 
-    def __init__(self, cfg: Config):
+    def __init__(self, cfg: Config | None):
         self.cfg = cfg
         self.lock = threading.Lock()
         self.rt = None
-        # 实现：rt 单例（同一时刻只跑一个实时监听）；lock 串行化历史导出与实时启停。
-        # 解析：ThreadingHTTPServer 每请求一线程，导出/实时都是重操作——全局锁保证
-        #       「两个浏览器标签同时点导出」不会交错写同一输出目录。
+        # 实现：cfg 允许 None——首次运行未配置数据根时进入 setup 模式（页面引导填路径生成 .env）。
+        # 解析：rt 单例（同一时刻只跑一个实时监听）；lock 串行化历史导出与实时启停。
         # 功能：所有 /api 处理器的宿主状态。
+
+    def setup(self, params: dict) -> dict:
+        """setup 模式：验证数据根 → 写进 .env → 加载完整配置进入正常面板。"""
+        raw = str(params.get("dataRoot") or "").strip().strip('"')
+        if not raw:
+            raise ValueError("请填写微信数据根（如 D:/xwechat_files）")
+        # 1) 路径展开 + 存在性校验（独立于 load_config——此刻 .env 还没写，不能走全量加载）。
+        from pathlib import Path as _P
+        expanded = _P(raw)
+        if not expanded.is_absolute():
+            from .config import project_root
+            expanded = project_root() / expanded
+        expanded = expanded.resolve()
+        if not expanded.is_dir():
+            raise ValueError(f"目录不存在：{raw}。路径在微信「设置→文件管理」里查看")
+        # 2) 写 .env（保留其它已有键），重新走一遍完整加载（顺带享受全部校验）。
+        set_env_key(KEY_DATA_ROOT, str(expanded))
+        self.cfg = load_config()
+        return {"ok": True}
+        # 实现：独立校验（is_dir）→ set_env_key 落盘 → load_config 全量校验并持有。
+        # 解析：校验和加载分离——用户填错路径时给出"目录不存在"这种可操作文案，而不是笼统的配置错误；
+        #       写入成功后 self.cfg 从 None 变为有效配置，随后的 GET / 就渲染正常面板。
+        # 功能：首次运行配置的落盘动作。
+
+    def match(self, query: str) -> dict:
+        """按名字模糊匹配会话（v1 ranked_matches 口径），供「按名字选择」。"""
+        if self.cfg is None:
+            raise ValueError("还未配置数据根")
+        exp = exporter.list_sessions(self.cfg)
+        sessions = session_mod.sessions_from_export(exp)
+        matches = session_mod.ranked_sessions(sessions, query)
+        return {"matches": matches, "unique": len(matches) == 1}
+        # 实现：匹配在全量会话（含公众号）上做——公众号也可能被想提取。
+        # 解析：unique 标记让前端"唯一命中自动勾选，歧义列候选"（v1 的交互语义）。
+        # 功能：/api/match 的数据源。
 
     def diagnose(self) -> dict:
         acc = exporter.list_accounts(self.cfg)
@@ -226,13 +260,20 @@ class _Handler(BaseHTTPRequestHandler):
     def _api(self, name: str, params: dict) -> dict:
         """API 分发（异常统一转 {"ok": false, "error"}）。"""
         app: App = self.server.app
+        if app.cfg is None and name != "setup":
+            # setup 模式：除配置写入外的接口一律拒绝，前端据此停留在配置页。
+            return {"ok": False, "error": "还未配置微信数据根", "need_setup": True}
         try:
+            if name == "setup":
+                return {"ok": True, **app.setup(params)}
             if name == "diagnose":
                 return {"ok": True, **app.diagnose()}
             if name == "sessions":
                 return {"ok": True, **app.sessions()}
             if name == "members":
                 return {"ok": True, **app.members(str(params.get("sid") or ""))}
+            if name == "match":
+                return {"ok": True, **app.match(str(params.get("query") or ""))}
             if name == "export":
                 return {"ok": True, **app.export(params)}
             if name == "realtime/start":
@@ -248,7 +289,7 @@ class _Handler(BaseHTTPRequestHandler):
             return {"ok": False, "error": str(e)}
         except (ValueError, FileNotFoundError) as e:
             return {"ok": False, "error": str(e)}
-        # 实现：按名字分发到 App 方法；ExporterError（含密钥/账号问题）与参数错误给可读 error。
+        # 实现：setup 模式闸 → 按名字分发到 App 方法；match 是新增的按名字选择接口。
         # 解析：刻意不裸接 Exception——真 bug 让它抛出去打日志，而不是被包装成"业务失败"。
         # 功能：API 层的统一错误协议。
 
@@ -257,7 +298,8 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_json({"ok": False, "error": "host 不允许"}, 403)
             return
         if self.path == "/":
-            body = PAGE.encode("utf-8")
+            app: App = self.server.app
+            body = (PAGE if app.cfg is not None else SETUP_PAGE).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
@@ -265,7 +307,7 @@ class _Handler(BaseHTTPRequestHandler):
             self.wfile.write(body)
         else:
             self._send_json({"ok": False, "error": "not found"}, 404)
-        # 实现：GET 只服务主页；Host 校验先行。
+        # 实现：GET 按配置状态渲染主页（未配置 → setup 页）或 404；Host 校验先行。
         # 功能：页面入口。
 
     def do_POST(self):
@@ -325,6 +367,12 @@ PAGE = """<!DOCTYPE html>
  </div>
  <div id="memberBox"></div>
  <div class="muted">群聊勾选后出现「成员」按钮：不点=导全群；点开后可勾选成员，只导被选成员的消息。</div>
+ <div style="border:1px dashed #ccd;border-radius:6px;padding:6px;margin-top:6px;background:#f5f8ff">
+  <b>按名字选择</b>（模糊匹配备注/昵称/微信号/群名）：
+  <input id="matchQuery" placeholder="如：张三 / 三哥 / zhangsan" style="width:240px">
+  <button onclick="matchName()">匹配</button>
+  <div id="matchResult" class="muted">唯一命中自动勾选；有歧义列候选让你点选。</div>
+ </div>
 </section>
 
 <section>
@@ -399,6 +447,38 @@ function filterList(kind){
     kind==="official"?s.sid.startsWith("gh_"):
     (!s.sid.endsWith("@chatroom") && !s.sid.startsWith("gh_")))
     .map(sessRow).join("");
+}
+async function matchName(){
+  const q=document.getElementById("matchQuery").value.trim();
+  const el=document.getElementById("matchResult");
+  if(!q){ el.textContent="请输入名字"; return; }
+  const d=await api("match",{query:q});
+  if(!d.ok){ show(el,false,d.error); return; }
+  if(!d.matches.length){ show(el,false,"没有匹配到任何联系人/群聊"); return; }
+  if(d.unique){
+    checkSid(d.matches[0].sid);
+    el.innerHTML=`<span class="ok">唯一命中：${esc(d.matches[0].display)}（${esc(d.matches[0].field)}）✓ 已在列表中勾选</span>`;
+    return;
+  }
+  el.innerHTML=`歧义：命中 ${d.matches.length} 个（点选即勾选）<br>`+
+    d.matches.map((m,i)=>`<label class="row" style="cursor:pointer;display:block">`+
+      `<input type="radio" name="matchPick" onclick="checkSid('${esc(m.sid)}')"> `+
+      `${i+1}. ${esc(m.display)}（${esc(m.field)}）<span class="meta">${esc(m.sid)}</span></label>`).join("");
+  // 实现：唯一命中直接勾选并高亮；歧义列候选（带命中字段与 sid），点选即勾选。
+  // 解析：v1 的「选编号」交互在网页里自然变成"点选"；候选来自 ranked_sessions 的降序列表。
+}
+function checkSid(sid){
+  const cb=document.querySelector(`input.sess[data-sid="${CSS.escape(sid)}"]`);
+  if(!cb) return false;
+  cb.checked=true;
+  const row=cb.closest(".row");
+  if(row){
+    row.style.background="#fff3cd";
+    row.scrollIntoView({block:"center"});
+    setTimeout(()=>{row.style.background="";},1600);
+  }
+  return true;
+  // 实现：按 sid 找到列表里的复选框勾选，滚动到位并高亮 1.6s（CSS.escape 防 sid 含特殊字符）。
 }
 async function loadMembers(sid){
   if(document.getElementById("mb_"+btoa(unescape(encodeURIComponent(sid))))) { return; }
@@ -492,8 +572,47 @@ modeChanged();
 # 功能：面板的全部用户界面。
 
 
-def serve(cfg: Config, port: int = 8765, open_browser: bool = True) -> None:
-    """启动面板（阻塞）；open_browser=True 时 0.6s 后自动打开浏览器（双击 bat 即用）。"""
+SETUP_PAGE = """<!DOCTYPE html>
+<html lang="zh"><head><meta charset="utf-8"><title>首次配置 · 微信聊天记录提取</title>
+<style>
+ body{font-family:"Microsoft YaHei",sans-serif;max-width:640px;margin:60px auto;padding:12px;color:#222}
+ input{padding:6px;font-size:14px} button{padding:6px 18px;cursor:pointer}
+ .err{color:#c00;white-space:pre-wrap} .ok{color:#070} .muted{color:#888;font-size:13px}
+</style></head><body>
+<h1>微信聊天记录提取 · 首次配置</h1>
+<section>
+ <p>程序需要知道<b>微信数据根目录</b>：在微信里打开 <b>设置 → 文件管理</b>，显示的路径
+ （形如 <code>D:/xwechat_files</code>）填到下面。程序绝不猜测这个位置。</p>
+ <input id="dataRoot" style="width:430px" placeholder="D:/xwechat_files">
+ <button onclick="save()">保存并进入面板</button>
+ <div id="msg" class="muted">保存后程序会把路径写进项目根的 .env（后续不再询问）。</div>
+</section>
+<script>
+function esc(s){return String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));}
+function show(el,ok,text){ el.className=ok?"ok":"err"; el.textContent=text; }
+async function api(name,params={}){
+  const r=await fetch("/api/"+name,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(params)});
+  return await r.json();
+}
+async function save(){
+  const el=document.getElementById("msg");
+  el.textContent="保存中…";
+  const d=await api("setup",{dataRoot:document.getElementById("dataRoot").value});
+  if(!d.ok){ show(el,false,d.error); return; }
+  show(el,true,"已写入 .env，正在进入面板…");
+  setTimeout(()=>location.reload(),600);
+}
+</script></body></html>
+"""
+# 实现：首次配置页（App.cfg 为 None 时 GET / 渲染本页）。
+# 解析：保存动作 = 校验目录存在 → 写 .env → reload 进正常面板；错误就地展示（目录不存在等）。
+# 功能：替代手工建 .env 的首次运行体验（用户拍板）。
+
+
+def serve(cfg: Config | None, port: int = 8765, open_browser: bool = True) -> None:
+    """启动面板（阻塞）；cfg=None 时进入首次配置模式。
+
+    open_browser=True 时 0.6s 后自动打开浏览器（双击 bat 即用）。"""
     server = ThreadingHTTPServer(("127.0.0.1", port), _Handler)
     server.daemon_threads = True
     server.app = App(cfg)

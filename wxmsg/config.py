@@ -69,6 +69,41 @@ def project_root() -> Path:
     # 功能：相对路径（output、bin、ASR 回退）的统一解析基准。
 
 
+def set_env_key(key: str, value: str, root: Path | None = None) -> Path:
+    """把 KEY=VALUE 写进项目根 .env：已存在的键替换值，其它行原样保留；文件不存在则新建。
+
+    返回写入的 .env 路径。面板「首次配置」用它落盘数据根。"""
+    env_path = (root or project_root()) / ENV_FILENAME
+    lines: list[str] = []
+    if env_path.exists():
+        text = env_path.read_text(encoding="utf-8-sig")
+        lines = text.splitlines()
+    # 实现：utf-8-sig 读（兼容记事本 BOM），逐行保留。
+    # 功能：旧 .env 的其它配置项（如 ASR 根）不被覆盖丢失。
+    replaced = False
+    out: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#") and "=" in stripped and \
+                stripped.split("=", 1)[0].strip() == key:
+            out.append(f"{key}={value}")
+            replaced = True
+        else:
+            out.append(line)
+    if not replaced:
+        if out and out[-1].strip():
+            out.append("")
+        out.append(f"{key}={value}")
+    # 实现：逐行匹配 key（忽略行内空白），命中则替换；没命中追加到文件尾（前面留一空行隔开注释块）。
+    # 解析：替换而非追加——同一键重复保存不会在 .env 里堆出多行（后行会被 load_env_file 的
+    #       dict 覆盖语义掩盖，但文件本身会越来越乱）。
+    # 功能：配置键的幂等写入。
+    env_path.write_text("\n".join(out) + "\n", encoding="utf-8", newline="\n")
+    return env_path
+    # 实现：LF 行尾写回（与 git/加载器口径一致，Windows 记事本也能正常打开）。
+    # 功能：面板 setup 与将来其它"程序写配置"场景的唯一入口。
+
+
 def load_env_file(path: Path) -> dict[str, str]:
     """读 .env 为 {KEY: VALUE}；utf-8-sig 编码；# 注释与空行跳过；无 '=' 的行忽略。"""
     env: dict[str, str] = {}

@@ -157,6 +157,23 @@ class TestHttpApi:
         # 实现：伪造 Host 头 → 403。
         # 功能：DNS rebinding 防线的集成验证。
 
+    def test_match_endpoint(self, server, monkeypatch):
+        monkeypatch.setattr(panel.exporter, "list_sessions", lambda cfg, **kw: {"sessions": [
+            {"sid": "wxid_zs", "is_group": False, "session_display": "", "remark": "张三",
+             "nickname": "", "alias": "", "sort_ts": 1},
+            {"sid": "wxid_w", "is_group": False, "session_display": "", "remark": "",
+             "nickname": "王三金", "alias": "", "sort_ts": 2},
+        ]})
+        out = _post(server, "/api/match", {"query": "张三"})
+        assert out["ok"] is True and out["unique"] is True
+        assert out["matches"][0]["sid"] == "wxid_zs" and out["matches"][0]["field"] == "备注"
+        out = _post(server, "/api/match", {"query": "三"})
+        assert out["ok"] is True and out["unique"] is False and len(out["matches"]) == 2
+        out = _post(server, "/api/match", {"query": "查无此人"})
+        assert out["matches"] == []
+        # 实现：/api/match 走 ranked_sessions（备注>微信号>昵称权重 + 三档程度）。
+        # 功能：按名字选择的后端协议（前端：唯一命中自动勾选，歧义列候选）。
+
     def test_realtime_lifecycle(self, server, monkeypatch):
         started = {}
         class FakeRT:
@@ -185,3 +202,35 @@ class TestHttpApi:
         assert out["ok"] is False and "没有正在运行" in out["error"]
         # 实现：start（捕获 targets/include_history）→ poll → state → stop → 空态报错。
         # 功能：实时生命周期协议（前端定时器按此驱动）。
+
+
+class TestSetupMode:
+    def test_setup_flow_over_http(self, tmp_path, monkeypatch):
+        # 把"项目根"重定向到 tmp：App.setup 写 .env、load_config 读 .env 都落在 tmp 里，
+        # 绝不触碰真实项目的 .env。
+        monkeypatch.setattr("wxmsg.config.project_root", lambda: tmp_path)
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), panel._Handler)
+        srv.daemon_threads = True
+        srv.app = panel.App(None)                       # 未配置态
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            html = urllib.request.urlopen(
+                f"http://127.0.0.1:{srv.server_port}/", timeout=10).read().decode("utf-8")
+            assert "首次配置" in html                    # 渲染的是 setup 页
+            out = _post(srv, "/api/sessions")
+            assert out["ok"] is False and out.get("need_setup") is True   # 未配置时业务接口全拒
+            out = _post(srv, "/api/setup", {"dataRoot": str(tmp_path / "nope")})
+            assert out["ok"] is False and "不存在" in out["error"]        # 坏路径给可操作文案
+            (tmp_path / "dr").mkdir()
+            out = _post(srv, "/api/setup", {"dataRoot": "dr"})            # 相对路径也支持
+            assert out["ok"] is True
+            assert (tmp_path / ".env").is_file()                          # .env 自动生成
+            assert srv.app.cfg is not None                                # 配置已加载
+            html2 = urllib.request.urlopen(
+                f"http://127.0.0.1:{srv.server_port}/", timeout=10).read().decode("utf-8")
+            assert "首次配置" not in html2                                 # reload 后是正常面板
+        finally:
+            srv.shutdown()
+        # 实现：未配置 → setup 页 + 业务接口闸 + 坏路径报错 + 好路径写 .env 进正常面板。
+        # 解析：project_root 重定向让 .env 读写都发生在 tmp（生产代码零改动、测试零污染）。
+        # 功能：首次配置（面板里填数据根）的完整闭环。

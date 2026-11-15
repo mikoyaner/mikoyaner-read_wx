@@ -8,7 +8,7 @@ import pytest
 
 from wxmsg.config import (
     ConfigError, DEFAULT_EXPORTER_BIN, DEFAULT_OUTPUT_DIR, DEFAULT_POLL_INTERVAL_S,
-    KEY_DATA_ROOT, load_config, load_env_file, project_root, resolve_path,
+    KEY_DATA_ROOT, load_config, load_env_file, project_root, resolve_path, set_env_key,
 )
 # 实现：import 被测函数与关键默认值常量。
 # 功能：测试引用与 config.example 对齐的常量，防默认值漂移。
@@ -194,3 +194,39 @@ def test_project_root_is_repo_root():
     # 实现：用仓库标志性文件验证 project_root 指向 read_wechat/。
     # 解析：project_root 是全部相对路径的基准，锚错会全局错位——用真实文件钉住。
     # 功能：验证项目根定位。
+
+
+class TestSetEnvKey:
+    def test_new_file(self, tmp_path):
+        p = set_env_key(KEY_DATA_ROOT, "D:/xwechat_files", root=tmp_path)
+        assert p == tmp_path / ".env"
+        assert load_env_file(p)[KEY_DATA_ROOT] == "D:/xwechat_files"
+        # 实现：.env 不存在则新建写入。
+        # 功能：面板 setup 的落盘。
+
+    def test_replace_existing_key(self, tmp_path):
+        (tmp_path / ".env").write_text("A=1\nWXMSG_DATA_ROOT=old\nB=2", encoding="utf-8")
+        set_env_key(KEY_DATA_ROOT, "new_root", root=tmp_path)
+        env = load_env_file(tmp_path / ".env")
+        assert env[KEY_DATA_ROOT] == "new_root"
+        assert env["A"] == "1" and env["B"] == "2"      # 其它键原样保留
+        raw = (tmp_path / ".env").read_text(encoding="utf-8")
+        assert raw.count("WXMSG_DATA_ROOT=") == 1        # 幂等：不堆重复行
+        # 实现：命中键替换、其它行保留、不产生重复行。
+        # 功能：重复保存不把 .env 写乱。
+
+    def test_append_key_to_commented_file(self, tmp_path):
+        (tmp_path / ".env").write_text("# 注释\nA=1\n", encoding="utf-8")
+        set_env_key("NEW_KEY", "v", root=tmp_path)
+        env = load_env_file(tmp_path / ".env")
+        assert env["NEW_KEY"] == "v" and env["A"] == "1"
+        # 实现：无命中键时追加文件尾。
+        # 功能：追加分支。
+
+    def test_roundtrip_loads(self, tmp_path):
+        set_env_key(KEY_DATA_ROOT, str(tmp_path / "dr"), root=tmp_path)
+        (tmp_path / "dr").mkdir()
+        cfg = load_config(root=tmp_path)                 # 不传 environ/dotenv → 真读刚写的 .env
+        assert cfg.data_root == (tmp_path / "dr").resolve()
+        # 实现：写完 .env 后 load_config 能直接读到（setup 模式的完整闭环）。
+        # 功能：落盘与加载的一致性。
