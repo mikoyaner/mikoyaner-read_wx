@@ -2,7 +2,8 @@
 # 实现：模块 docstring 声明测试范围（全部纯函数）。
 # 功能：锁定用户拍板的名称回退口径与排序口径。
 from wxmsg.session import (
-    Member, Session, build_sender_map, members_from_export, sessions_from_export, sort_messages,
+    Member, Session, build_sender_map, members_from_export, ranked_sessions,
+    sessions_from_export, sort_messages,
 )
 # 实现：import 被测函数与数据类。
 # 功能：取得被测对象。
@@ -93,6 +94,62 @@ class TestBuildSenderMap:
         # 功能：验证先到先得语义。
 
 
+class TestRankedSessions:
+    def _sess(self, **kw):
+        base = dict(sid="wxid_x", is_group=False, session_display="", remark="",
+                    nickname="", alias="", sort_ts=0)
+        base.update(kw)
+        return Session(**base)
+        # 实现：Session 快捷构造。
+        # 功能：匹配测试夹具。
+
+    def test_field_priority(self):
+        sessions = [self._sess(sid="wxid_a", remark="张三", nickname="三哥", alias="zs")]
+        out = ranked_sessions(sessions, "张三")
+        assert out[0]["field"] == "备注" and out[0]["degree"] == 3 and out[0]["score"] == 35
+        out = ranked_sessions(sessions, "三哥")
+        assert out[0]["field"] == "昵称" and out[0]["score"] == 33
+        out = ranked_sessions(sessions, "zs")
+        assert out[0]["field"] == "微信号" and out[0]["score"] == 34
+        # 实现：字段权重 备注5 > 微信号4 > 昵称3（v1 ranked_matches 同款）。
+        # 解析：score = degree*10 + rank（全等命中 → 3*10+权重）。
+        # 功能：字段优先级锚点。
+
+    def test_degree_tiers(self):
+        sessions = [self._sess(sid="wxid_a", nickname="王大锤")]
+        out = ranked_sessions(sessions, "王大锤")
+        assert out[0]["degree"] == 3                            # 完全相等
+        out = ranked_sessions(sessions, "王大")
+        assert out[0]["degree"] == 2                            # 前缀
+        out = ranked_sessions(sessions, "大锤")
+        assert out[0]["degree"] == 1                            # 包含
+        out = ranked_sessions(sessions, "李逵")
+        assert out == []                                        # 不匹配 → 空候选
+        # 实现：三档程度（相等/前缀/包含）。
+        # 功能：程度分档锚点。
+
+    def test_unique_flag_semantics(self):
+        # 同分场景：两条都是「备注命中 + 前缀」→ score 相同 → 按展示名字典序保证可复现
+        two = [self._sess(sid="a", remark="王哥"), self._sess(sid="b", remark="王二")]
+        out = ranked_sessions(two, "王")
+        assert len(out) == 2 and out[0]["score"] == out[1]["score"] == 25
+        assert out[0]["display"] <= out[1]["display"]           # 同分按展示名字典序
+        assert out[0]["display"] == "王二" and out[1]["display"] == "王哥"
+        # 实现：同分字典序（HashMap 迭代序不确定，排序保证可复现——v1 同款）。
+        # 功能：歧义候选排序。
+
+    def test_empty_query(self):
+        assert ranked_sessions([self._sess()], "") == []
+        assert ranked_sessions([self._sess()], "   ") == []
+        # 实现：空查询返回空（避免空串 contains 命中所有人——v1 同款防御）。
+        # 功能：空查询分支。
+
+    def test_group_session_display_matches(self):
+        g = self._sess(sid="g@chatroom", is_group=True, nickname="前端交流群")
+        out = ranked_sessions([g], "前端")
+        assert out[0]["is_group"] is True and out[0]["field"] == "昵称"
+        # 实现：群名（昵称槽位）参与匹配。
+        # 功能：群聊按群名搜索。
 class TestSortMessages:
     def test_order_by_time_then_seq_then_id(self):
         rows = [

@@ -127,6 +127,69 @@ def build_sender_map(sessions: list[Session], members: list[Member]) -> dict[str
     # 功能：render.py 解析群内发送者名的唯一数据源。
 
 
+def _match_degree(query: str, value: str) -> int:
+    """匹配程度三档（v1 ranked_matches 同款）：3=完全相等 2=双向前缀 1=包含，0=不匹配。"""
+    v = value.strip().lower()
+    if not v:
+        return 0
+    q = query.strip().lower()
+    if v == q:
+        return 3
+    if v.startswith(q) or q.startswith(v):
+        return 2
+    if q in v:
+        return 1
+    return 0
+    # 实现：与 v1 degree() 逐条对应——空值 0、相等 3、任一方为另一方前缀 2、包含 1。
+    # 解析：「q 是 v 的前缀」也计 2（v1 口径），短昵称能被长查询前缀命中。
+    # 功能：名字匹配的评分原语。
+
+
+# 字段权重（v1 ranked_matches 同款）：备注 5 > 微信号/原始id 4 > 昵称 3 > 会话显示名 2。
+_FIELD_RANKS = ((5, "备注"), (4, "微信号"), (4, "微信号/原始id"), (3, "昵称"), (2, "会话显示名"))
+_FIELD_KEYS = ("remark", "alias", "sid", "nickname", "session_display")
+# 实现：权重与 Session 字段一一对应（元组平行数组）。
+# 解析：v1 把 alias 与原始 id 同档（都是"对外 id"口径）；会话显示名最弱（群名兜底）。
+# 功能：ranked_sessions 的字段优先级表。
+
+
+def ranked_sessions(sessions: list[Session], query: str) -> list[dict]:
+    """按名字模糊匹配会话（v1 ranked_matches 口径：先比匹配程度，同档再比字段权重）。
+
+    返回按得分降序的候选：{sid, display, is_group, degree(1-3), field(命中字段名), score}。
+    得分 = degree*10 + 字段权重；同分按展示名字典序（保证可复现，v1 同款）。
+    """
+    q = (query or "").strip().lower()
+    if not q:
+        return []
+    best: dict[str, tuple[Session, int, int, str]] = {}
+    for s in sessions:
+        top: tuple[int, int, str] | None = None
+        for (rank, tag), key in zip(_FIELD_RANKS, _FIELD_KEYS):
+            value = getattr(s, key)
+            degree = _match_degree(q, value)
+            if degree == 0:
+                continue
+            if top is None or degree * 10 + rank > top[0] * 10 + top[1]:
+                top = (degree, rank, tag)
+        # 实现：对每个人按五个字段逐个算分，取最高分作为这个人的代表（v1 同款）。
+        # 解析：top=None 表示五个字段全不命中——该人不进候选。
+        if top is not None:
+            best[s.sid] = (s, top[0], top[1], top[2])
+    out = [{
+        "sid": s.sid,
+        "display": s.display_name(),
+        "is_group": s.is_group,
+        "degree": degree,
+        "field": tag,
+        "score": degree * 10 + rank,
+    } for s, degree, rank, tag in best.values()]
+    out.sort(key=lambda x: (-x["score"], x["display"]))
+    return out
+    # 实现：得分降序、同分展示名字典序（HashMap 迭代序不确定，排序保证可复现——v1 同款）。
+    # 功能：面板「按名字匹配」的唯一评分实现。
+
+
 def sort_messages(rows: list[dict]) -> list[dict]:
     """消息按时间正序排序：主键 create_time，同秒按 sort_seq，再按 local_id（全稳定）。
 
